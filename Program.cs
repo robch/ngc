@@ -996,12 +996,32 @@ class Program
                 return options;
             }
             
-            Console.WriteLine("NGramCounter (ngc) v1.0 - Statistical n-gram analysis for code and documentation");
+            Console.WriteLine("NGramCounter (ngc) v1.0 - N-gram frequency counter for piped text");
+            
+            Console.WriteLine("\nWHAT NGC DOES:");
+            Console.WriteLine("  - Counts n-gram frequencies in YOUR piped input");
+            Console.WriteLine("  - Calculates descriptive statistics (mean, std dev, percentiles) OF YOUR INPUT");
+            Console.WriteLine("  - Filters and sorts by these measures");
+            Console.WriteLine();
+            Console.WriteLine("WHAT NGC DOES NOT DO:");
+            Console.WriteLine("  - Does NOT determine if patterns are important or meaningful");
+            Console.WriteLine("  - Does NOT tell you if patterns generalize beyond your input");
+            Console.WriteLine("  - Does NOT perform statistical hypothesis testing or significance testing");
+            Console.WriteLine("  - Does NOT establish causation or explain WHY patterns occur");
+            Console.WriteLine();
+            Console.WriteLine("⚠️  HASTY GENERALIZATION WARNING:");
+            Console.WriteLine("  Small samples → weak conclusions. A pattern in ONE file/repo does NOT prove:");
+            Console.WriteLine("    • It's common across the domain");
+            Console.WriteLine("    • It's important or essential");
+            Console.WriteLine("    • It generalizes to other languages/contexts");
+            Console.WriteLine("  Document your sample size and scope. Validate across diverse sources.");
+            Console.WriteLine();
+            Console.WriteLine("INTERPRET WITH CAUTION: Frequency ≠ Importance, Sample ≠ Population");
             
             Console.WriteLine("\nQUICK START:");
-            Console.WriteLine("  ngc 1 top:30 rev         # Most common terms, highest frequency first");
+            Console.WriteLine("  ngc 1 top:30 rev         # Most frequent terms, highest to lowest");
             Console.WriteLine("  ngc 2..3 \"pattern\" rev   # 2-3 word phrases containing \"pattern\"");
-            Console.WriteLine("  ngc 1 percentile:5 +++   # Statistical outliers with detailed metrics");
+            Console.WriteLine("  ngc 1 percentile:5 +++   # Top/bottom 5% by frequency, with metrics");
             
             Console.WriteLine("\nN-GRAM SIZE:");
             Console.WriteLine("  3         # Only trigrams (3-word phrases)");
@@ -1025,12 +1045,12 @@ class Program
             Console.WriteLine("  freq:!5..20 # Outside the range 5-20 occurrences");
             Console.WriteLine("  freq:10     # Exactly 10 occurrences");
             
-            Console.WriteLine("\nSTATISTICAL FILTERS:");
+            Console.WriteLine("\nDESCRIPTIVE FILTERS (apply to YOUR input only):");
             Console.WriteLine("  percentile:90+     # Top 10% most frequent items");
             Console.WriteLine("  percentile:..50    # Bottom 50% of items");
             Console.WriteLine("  percentile:25..75  # Middle 50% of items (interquartile range)");
             Console.WriteLine("  percentile:!25..75 # Outside the middle range (potential outliers)");
-            Console.WriteLine("  percentile:5       # Statistical outliers (top AND bottom 5%)");
+            Console.WriteLine("  percentile:5       # Top/bottom 5% by frequency in YOUR input (not 'outliers')");
             Console.WriteLine("  ");
             Console.WriteLine("  ppm:1000+          # At least 1000 occurrences per million tokens");
             Console.WriteLine("  ppm:500..1000      # Between 500-1000 occurrences per million");
@@ -1042,14 +1062,14 @@ class Program
             Console.WriteLine("\nOUTPUT OPTIONS:");
             Console.WriteLine("  +                  # Enhanced output with PPM values");
             Console.WriteLine("  ++                 # Show both merged AND separate n-gram sizes");
-            Console.WriteLine("  +++                # Full statistical details (PPM, Z-score)");
+            Console.WriteLine("  +++                # Full descriptive details (PPM, Z-score relative to YOUR input)");
             Console.WriteLine("  --                 # Minimal output (phrases only)");
             Console.WriteLine("  ---                # Statistics only (no phrases)");
             Console.WriteLine("  ");
             Console.WriteLine("  asc                # Sort ascending (least frequent first)");
             Console.WriteLine("  desc/rev           # Sort descending (most frequent first)");
             Console.WriteLine("  sort:count         # Sort by raw count (default)");
-            Console.WriteLine("  sort:ppm           # Sort by statistical significance (PPM)");
+            Console.WriteLine("  sort:ppm           # Sort by normalized frequency (parts per million - NOT statistical significance!)");
             Console.WriteLine("  ");
             Console.WriteLine("  top:50             # Show only top 50 most frequent results");
             Console.WriteLine("  top:10%            # Show top 10% of results");
@@ -1059,27 +1079,27 @@ class Program
             Console.WriteLine("\nANALYSIS STRATEGIES:");
             Console.WriteLine("  ");
             Console.WriteLine("  # Exploratory Analysis (Start Here)");
-            Console.WriteLine("  ngc 1 top:30 rev                    # Most common terms");
-            Console.WriteLine("  ngc 2 percentile:95+ rev            # Most statistically significant phrases");
-            Console.WriteLine("  ngc 1 percentile:5 rev +++          # Statistical outliers with full metrics");
+            Console.WriteLine("  ngc 1 top:30 rev                    # Most frequent terms in your input");
+            Console.WriteLine("  ngc 2 percentile:95+ rev            # Top 5% most frequent phrases in your input");
+            Console.WriteLine("  ngc 1 percentile:5 rev +++          # Top/bottom 5% by frequency, with metrics");
             Console.WriteLine("  ");
             Console.WriteLine("  # Code Structure Analysis");
             Console.WriteLine("  ngc 2 \"class [A-Z]\" rev             # Find class definitions");
             Console.WriteLine("  ngc 3 \"public (class|interface)\" rev # Find public type definitions");
-            Console.WriteLine("  ngc 3 \"new [A-Z]\" sort:ppm rev      # Object instantiation by significance");
-            Console.WriteLine("  ngc 2 \"import|using\" top:20 rev     # Most common dependencies");
+            Console.WriteLine("  ngc 3 \"new [A-Z]\" sort:ppm rev      # Object instantiation by normalized frequency");
+            Console.WriteLine("  ngc 2 \"import|using\" top:20 rev     # Most frequent dependencies");
             Console.WriteLine("  ");
-            Console.WriteLine("  # Code Quality Patterns");
-            Console.WriteLine("  ngc 3 \"if\" z:!2 freq:5+ rev         # Unusual but recurring conditionals");
-            Console.WriteLine("  ngc 2 \"null\" percentile:95+ rev     # Most common null reference patterns");
-            Console.WriteLine("  ngc 3 \"try catch\" sort:ppm rev      # Error handling by significance");
+            Console.WriteLine("  # Frequency Pattern Discovery");
+            Console.WriteLine("  ngc 3 \"if\" z:!2 freq:5+ rev         # 'if' patterns >2 std devs from mean, 5+ occurrences");
+            Console.WriteLine("  ngc 2 \"null\" percentile:95+ rev     # Top 5% most frequent null-related patterns");
+            Console.WriteLine("  ngc 3 \"try catch\" sort:ppm rev      # Error handling patterns by normalized frequency");
             Console.WriteLine("  ngc 2 \"TODO|FIXME\" rev              # Find technical debt markers");
             Console.WriteLine("  ");
             Console.WriteLine("  # Documentation Analysis");
-            Console.WriteLine("  ngc 3 \"should\" percentile:80+ rev   # Find requirements and expectations");
-            Console.WriteLine("  ngc 2 -the -a -an -of -in percentile:95+ # Key terms without noise words");
-            Console.WriteLine("  ngc 3 \"Inconsistencies|Issues\" rev  # Find documented problems and gaps");
-            Console.WriteLine("  ngc 2 \"is|are\" z:!2 freq:5+ +++     # Unusual definitions that appear repeatedly");
+            Console.WriteLine("  ngc 3 \"should\" percentile:80+ rev   # Top 20% frequent 'should' phrases");
+            Console.WriteLine("  ngc 2 -the -a -an -of -in percentile:95+ # Frequent terms excluding common words");
+            Console.WriteLine("  ngc 3 \"Inconsistencies|Issues\" rev  # Find problem-related phrases");
+            Console.WriteLine("  ngc 2 \"is|are\" z:!2 freq:5+ +++     # Definition patterns >2 std devs, with metrics");
             
             Console.WriteLine("\nTROUBLESHOOTING:");
             Console.WriteLine("  ");
@@ -1087,13 +1107,13 @@ class Program
             Console.WriteLine("  1. Try broadening your n-gram size range (e.g., ngc 1..3 instead of just ngc 2)");
             Console.WriteLine("  2. Reduce the strictness of your filters (lower percentile or frequency thresholds)");
             Console.WriteLine("  3. Check if your regex pattern might need escaping or simplification");
-            Console.WriteLine("  4. For statistical filters, ensure you have enough text to generate meaningful statistics");
+            Console.WriteLine("  4. For descriptive filters, ensure you have enough text (larger sample = more reliable stats)");
             Console.WriteLine("  ");
             Console.WriteLine("  # For better results:");
-            Console.WriteLine("  1. Chain filters gradually - start broad, then add constraints one at a time");
-            Console.WriteLine("  2. Use '+++' to see statistical details when results seem incorrect");
-            Console.WriteLine("  3. Try both 'sort:count' and 'sort:ppm' as they can surface different insights");
-            Console.WriteLine("  4. For documentation, filter out common words (-the -a -an -of -in) to reduce noise");
+            Console.WriteLine("  1. Increase sample size: More diverse input = more generalizable patterns");
+            Console.WriteLine("  2. Document your input source: What repos/files did you analyze?");
+            Console.WriteLine("  3. Use '+++' to see full metrics when results seem incorrect");
+            Console.WriteLine("  4. Validate against different samples: Same pattern in diverse sources = stronger evidence");
             
             Console.WriteLine("\nCOMMON COMBINATIONS:");
             Console.WriteLine("  ngc 1..3 percentile:5 rev           # Statistical outliers across different n-gram sizes");
