@@ -75,6 +75,12 @@ class CommandOptions
     public bool MinimalOutput = false;
     public bool StatsOnly = false; // Only show statistics, not full phrase lists
     public List<double> UniquePercentiles = new List<double>();
+    // Case sensitivity for all text filters (--contains/--starts/--ends/etc. and their
+    // --remove-* siblings): case-SENSITIVE by default (matches ngc's own documented use
+    // cases, e.g. `--contains "class [A-Z]"` / `--contains "new [A-Z]"` for finding
+    // capitalized identifiers — those examples only make sense if case is respected).
+    // --ignore-case opts into case-insensitive matching for prose-style searches.
+    public bool IgnoreCase = false;
     public List<string> ExcludeFiles = new List<string>();
 
     // --show-x / --hide-x granular flags (presets below are just bundles of these)
@@ -97,12 +103,54 @@ class CommandOptions
     public bool ShowCdf = false;
     public bool ShowPmi = false;
     public bool ShowTfidf = false;
+    // Separate namespace/report: n-grams built from the interior segments of path-like
+    // units (e.g. "src/whatever" from "src/whatever/services"), distinct from prose n-grams.
+    public bool ShowPathNGrams = false;
+    // Stopword filtering: on by default. An n-gram is dropped only if EVERY word in it is a
+    // stopword (mixed phrases like "the guard" are kept). Starting basis is either
+    // StopWords.Default or empty, decided by a pre-scan for --no-stop-words (see ParseArgs);
+    // --stop-words word1 word2 ... is then always purely ADDITIVE on top of that basis,
+    // regardless of where --no-stop-words appears on the command line. An empty set here
+    // naturally means "filter off" (no phrase can be all-stopwords against an empty set).
+    public HashSet<string> EffectiveStopWords = new HashSet<string>(StopWords.Default, StringComparer.OrdinalIgnoreCase);
+    // Trim-word filtering: on by default. An n-gram is dropped if its FIRST OR LAST token is
+    // a trim word — a stricter, position-sensitive sibling of stopword filtering (see
+    // TrimWords.cs for why this is a genuinely different, smaller set, not just a reuse of
+    // StopWords). Same --no-trim-words / --trim-words additive semantics as stopwords above.
+    public HashSet<string> EffectiveTrimWords = new HashSet<string>(TrimWords.Default, StringComparer.OrdinalIgnoreCase);
     public bool PerFile = false;
     // --files glob1 [glob2 ...] — when non-empty, read these files/globs as
     // separate documents instead of reading stdin as one blob. Relative globs
     // (including "../" parent-traversal, e.g. "../other-repo/**/*.cs") are
     // supported — see LooksLikeFileGlob's ".." handling in ParseArgs.
     public List<string> FileGlobs = new List<string>();
+    // --line-contains / --remove-line-contains PATTERN — a genuinely separate filter
+    // stage from --contains/etc. above: applied to whole SOURCE LINES, BEFORE
+    // tokenization, deciding which lines even enter the n-gram token pool at all.
+    // --contains and friends filter the already-built n-gram PHRASE results after the
+    // fact; this filters the raw corpus lines beforehand. Reuses TextFilter's
+    // Contains/NotContains matching machinery (see PassTextFilters), just against a
+    // different string (the whole line) at a different pipeline stage.
+    public List<TextFilter> LineFilters = new List<TextFilter>();
+    // --top-files N (with --top-files 0 meaning unlimited/default) — caps how many of
+    // the matched --files documents get a full breakdown table under
+    // `--show-tfidf --per-file`, after ranking documents by an aggregate per-file
+    // distinctiveness score (see TopFilesBy). Mirrors the existing --max-items
+    // rank+cap+trailing-notice convention, applied one level up (files, not rows).
+    public int TopFiles = int.MaxValue;
+    // How to aggregate a single file's many per-ngram TF-IDF scores into one ranking
+    // score for --top-files: "max" (that file's single highest-scoring ngram — cheap,
+    // but one outlier term can dominate), "sum" (rewards breadth of distinctiveness),
+    // or "avg-top5" (default — average of the file's top 5 ngram scores; robust,
+    // rewards several distinctive terms rather than one fluke).
+    public string TopFilesBy = "avg-top5";
+    // --max-items-per-file N (0 = unlimited) — caps ROWS shown within EACH file's own
+    // breakdown table under `--show-tfidf --per-file`, independently of the global
+    // --max-items cap (which, before this flag existed, was the only knob controlling
+    // per-file row counts too — see ngc-feedback.md #3). Small default so `--per-file` is
+    // usable out of the box across many files without needing to hand-tune the global cap
+    // down first.
+    public int MaxItemsPerFile = 15;
 }
 
 class Program
@@ -118,9 +166,11 @@ class Program
     public static List<string> DocumentNames { get; set; } = new List<string>();
     public static Dictionary<string, Dictionary<int, Dictionary<string, int>>> PerDocNGramCounts { get; set; } = new Dictionary<string, Dictionary<int, Dictionary<string, int>>>();
     public static Dictionary<string, Dictionary<int, int>> PerDocTotalTokensPerN { get; set; } = new Dictionary<string, Dictionary<int, int>>();
+    public static Dictionary<string, Dictionary<int, Dictionary<string, int>>> PerDocPathSegmentNGramCounts { get; set; } = new Dictionary<string, Dictionary<int, Dictionary<string, int>>>();
+    public static Dictionary<string, Dictionary<int, int>> PerDocPathSegmentTotalTokensPerN { get; set; } = new Dictionary<string, Dictionary<int, int>>();
         
     // Helper method to detect if a pattern contains regex special characters and compile it
-    private static bool TryCompileRegex(string pattern, out Regex regex)
+    private static bool TryCompileRegex(string pattern, out Regex regex, bool ignoreCase = false)
     {
         regex = null!;
         // Check for common regex metacharacters
@@ -129,7 +179,8 @@ class Program
             
         try
         {
-            regex = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Compiled);
+            var opts = RegexOptions.Compiled | (ignoreCase ? RegexOptions.IgnoreCase : RegexOptions.None);
+            regex = new Regex(pattern, opts);
             return true;
         }
         catch (ArgumentException)
@@ -141,6 +192,14 @@ class Program
 
     static void Main(string[] args)
     {
+        // Fix for garbled Unicode output (ngc-feedback.md #5): ngc's own --help text embeds
+        // real Unicode glyphs (⚠️, →, ≠, etc.), and file content read via --files is UTF-8.
+        // Without explicitly setting the console's output encoding, many consoles/capture
+        // pipes default to a legacy codepage and silently replace those glyphs with '?' at
+        // print time. Set this before any output is written.
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+        Console.InputEncoding = System.Text.Encoding.UTF8;
+
         var options = ParseArgs(args);
         
         // Store options for access by static methods
@@ -208,10 +267,22 @@ class Program
         var nGramCounts = new Dictionary<int, Dictionary<string, int>>();
         foreach (int n in collectSizes) nGramCounts[n] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
+        // Path-segment n-grams: a separate namespace/dictionary set for the interior
+        // segments of path-like units (e.g. "src/whatever/services" -> segments "src",
+        // "whatever", "services"). These are structurally different from prose n-grams
+        // (segment adjacency reflects directory nesting, not English word order) so they
+        // are never merged into nGramCounts. See --show-path-ngrams / PrintPathNGrams.
+        var pathSegmentNGramCounts = new Dictionary<int, Dictionary<string, int>>();
+        foreach (int n in collectSizes) pathSegmentNGramCounts[n] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var pathSegmentTotalTokensPerN = new Dictionary<int, int>();
+        foreach (int n in collectSizes) pathSegmentTotalTokensPerN[n] = 0;
+
         // Per-document n-gram data, kept for future document-boundary features
         // (e.g. TF-IDF): one dictionary-of-dictionaries per matched document.
         var perDocNGramCounts = new Dictionary<string, Dictionary<int, Dictionary<string, int>>>();
         var perDocTotalTokensPerN = new Dictionary<string, Dictionary<int, int>>();
+        var perDocPathSegmentNGramCounts = new Dictionary<string, Dictionary<int, Dictionary<string, int>>>();
+        var perDocPathSegmentTotalTokensPerN = new Dictionary<string, Dictionary<int, int>>();
 
         // Input statistics tracking (aggregate across all documents)
         int totalChars = 0;
@@ -229,40 +300,69 @@ class Program
             var docTotalTokensPerN = new Dictionary<int, int>();
             foreach (int n in collectSizes) docTotalTokensPerN[n] = 0;
 
+            var docPathSegmentNGramCounts = new Dictionary<int, Dictionary<string, int>>();
+            foreach (int n in collectSizes) docPathSegmentNGramCounts[n] = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var docPathSegmentTotalTokensPerN = new Dictionary<int, int>();
+            foreach (int n in collectSizes) docPathSegmentTotalTokensPerN[n] = 0;
+
             foreach (var line in docLines)
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
-                var sb = new StringBuilder(line.Length);
-                foreach (var ch in line)
+                if (!PassLineFilters(line, options.LineFilters, options.IgnoreCase)) continue;
+
+                // Layer 1+2: detect atomic units (paths, quoted spans) first, then split
+                // the remaining plain text into words using the existing alnum+hyphen rule.
+                var tokens = Tokenizer.Tokenize(line);
+
+                // Layer 3a: prose n-grams. Each token contributes exactly one slot via
+                // Display — a Unit (e.g. a path) never fragments into multiple slots, so it
+                // can never bridge into a fake multi-word phrase with its interior segments.
+                var displayWords = tokens.Select(t => t.Display).ToList();
+                totalWords += displayWords.Count;
+                NGramBuilder.CollectNGrams(displayWords, collectSizes, nGramCounts, totalTokensPerN);
+                NGramBuilder.CollectNGrams(displayWords, collectSizes, docNGramCounts, docTotalTokensPerN);
+
+                // Layer 3b: unigram word-frequency feed. A Unit's own Display token is NOT
+                // counted as a unigram (it's not really "a word"); instead each of its
+                // interior segments/words is counted individually, same as ordinary prose
+                // words, so overall word-frequency stats stay accurate.
+                if (collectSizes.Contains(1))
                 {
-                    if (char.IsLetterOrDigit(ch) || ch == '-') sb.Append(ch); else sb.Append(' ');
-                }
-                var words = sb.ToString().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                totalWords += words.Length;
-                for (int n = 1; n <= (collectSizes.Count > 0 ? collectSizes.Max() : 3); n++)
-                {
-                    if (!collectSizes.Contains(n)) continue;
-                    if (words.Length < n) continue;
-                    var tokenCountForLine = Math.Max(0, words.Length - n + 1);
-                    totalTokensPerN[n] += tokenCountForLine;
-                    docTotalTokensPerN[n] += tokenCountForLine;
-                    for (int i = 0; i <= words.Length - n; i++)
+                    foreach (var t in tokens)
                     {
-                        var ngram = string.Join(" ", words.Skip(i).Take(n));
-                        if (nGramCounts[n].ContainsKey(ngram)) nGramCounts[n][ngram]++; else nGramCounts[n][ngram] = 1;
-                        if (docNGramCounts[n].ContainsKey(ngram)) docNGramCounts[n][ngram]++; else docNGramCounts[n][ngram] = 1;
+                        if (!t.IsUnit) continue;
+                        foreach (var interiorWord in t.Unit!.InteriorSegments)
+                        {
+                            if (nGramCounts[1].TryGetValue(interiorWord, out var c1)) nGramCounts[1][interiorWord] = c1 + 1; else nGramCounts[1][interiorWord] = 1;
+                            if (docNGramCounts[1].TryGetValue(interiorWord, out var c2)) docNGramCounts[1][interiorWord] = c2 + 1; else docNGramCounts[1][interiorWord] = 1;
+                            totalTokensPerN[1]++;
+                            docTotalTokensPerN[1]++;
+                        }
                     }
+                }
+
+                // Layer 4: path-segment n-grams, a separate namespace scoped to each
+                // Path unit's own interior segments (e.g. "src/whatever", "whatever/services").
+                foreach (var t in tokens)
+                {
+                    if (!t.IsUnit || t.Unit!.Kind != UnitKind.Path) continue;
+                    NGramBuilder.CollectNGrams(t.Unit.InteriorSegments, collectSizes, pathSegmentNGramCounts, pathSegmentTotalTokensPerN, "/");
+                    NGramBuilder.CollectNGrams(t.Unit.InteriorSegments, collectSizes, docPathSegmentNGramCounts, docPathSegmentTotalTokensPerN, "/");
                 }
             }
 
             perDocNGramCounts[docName] = docNGramCounts;
             perDocTotalTokensPerN[docName] = docTotalTokensPerN;
+            perDocPathSegmentNGramCounts[docName] = docPathSegmentNGramCounts;
+            perDocPathSegmentTotalTokensPerN[docName] = docPathSegmentTotalTokensPerN;
         }
 
         // Make per-document data available for later features (TF-IDF etc.)
         Program.DocumentNames = documents.Select(d => d.Name).ToList();
         Program.PerDocNGramCounts = perDocNGramCounts;
         Program.PerDocTotalTokensPerN = perDocTotalTokensPerN;
+        Program.PerDocPathSegmentNGramCounts = perDocPathSegmentNGramCounts;
+        Program.PerDocPathSegmentTotalTokensPerN = perDocPathSegmentTotalTokensPerN;
 
 
         // Load exclude files into text filters
@@ -276,7 +376,7 @@ class Program
                     var t = l.Trim();
                     if (t.Length == 0) continue;
                     var filter = new TextFilter { Type = TextFilter.TypeEnum.NotContains, Pattern = t };
-                    if (TryCompileRegex(t.ToLower(), out Regex regex))
+                    if (TryCompileRegex(t, out Regex regex, options.IgnoreCase))
                         filter.CompiledRegex = regex;
                     options.TextFilters.Add(filter);
                 }
@@ -381,7 +481,9 @@ class Program
             {
                 var ngram = kv.Key; var count = kv.Value; var ppm = needPpm ? ppmValues[n][ngram] : 0.0; var z = needZ ? zValues[n][ngram] : 0.0;
                 var pmi = (needPmi && n >= 2 && pmiValues.ContainsKey(n)) ? pmiValues[n][ngram] : 0.0;
-                if (!PassTextFilters(ngram, options.TextFilters)) continue;
+                if (!PassTextFilters(ngram, options.TextFilters, options.IgnoreCase)) continue;
+                if (!PassStopwordFilter(ngram, options)) continue;
+                if (!PassTrimFilter(ngram, options)) continue;
                 if (!PassFrequencyFilters(count, options.FrequencyFilters)) continue;
                 if (!PassPpmFilters(ppm, options.PpmFilters)) continue;
                 if (!PassZFilters(z, options.ZFilters)) continue;
@@ -489,15 +591,25 @@ class Program
         if (options.MinimalOutput)
         {
             // only ngrams lines from merged or per-bucket depending on ShowMerged/ShowSeparate
+            // NOTE: the global --max-items cap must still apply here too (--less/--less-- were
+            // previously bypassing it entirely, since ApplyMaxItemsCap was only wired into the
+            // non-minimal code paths below — found while re-verifying each preset after the
+            // ngc-feedback.md #2 grammar rewrite).
             if (options.ShowMerged)
             {
-                foreach (var it in SortAndLimit(merged, options)) PrintEntry(it, options, "merged");
+                var mergedList = SortAndLimit(merged, options).ToList();
+                var cappedMergedMinimal = ApplyMaxItemsCap(mergedList, options, options.Sort == SortDirection.Asc ? "ascending" : "descending", out var mergedMinimalNotice);
+                foreach (var it in cappedMergedMinimal) PrintEntry(it, options, "merged");
+                if (mergedMinimalNotice != null) Console.WriteLine(mergedMinimalNotice);
             }
             else
             {
                 foreach (var n in options.NGramSizes.OrderBy(x => x))
                 {
-                    foreach (var it in SortAndLimit(outputs[n], options)) PrintEntry(it, options, n.ToString());
+                    var list = SortAndLimit(outputs[n], options).ToList();
+                    var cappedList = ApplyMaxItemsCap(list, options, options.Sort == SortDirection.Asc ? "ascending" : "descending", out var minimalNotice);
+                    foreach (var it in cappedList) PrintEntry(it, options, n.ToString());
+                    if (minimalNotice != null) Console.WriteLine(minimalNotice);
                 }
             }
             return;
@@ -749,6 +861,49 @@ class Program
             if (options.ShowSectionHeader) Console.WriteLine();
             PrintTfidf(options);
         }
+
+        if (options.ShowPathNGrams)
+        {
+            if (options.ShowSectionHeader) Console.WriteLine();
+            PrintPathNGrams(pathSegmentNGramCounts, options);
+        }
+    }
+
+    // Prints the path-segment n-gram section: same filter/sort/print machinery as the main
+    // prose n-gram sections, but reading from the separate pathSegmentNGramCounts namespace
+    // and joining ngram display with "/" instead of a space, since these reflect directory
+    // nesting/adjacency rather than English word order.
+    static void PrintPathNGrams(Dictionary<int, Dictionary<string, int>> pathSegmentNGramCounts, CommandOptions options)
+    {
+        foreach (var n in options.NGramSizes.OrderBy(x => x))
+        {
+            if (!pathSegmentNGramCounts.TryGetValue(n, out var counts) || counts.Count == 0) continue;
+
+            if (options.ShowSectionHeader)
+            {
+                Console.WriteLine($"## Path-Segment {n}-grams (from path-like units, e.g. \"src/whatever\")");
+                Console.WriteLine();
+            }
+
+            var list = new List<(string ngram, int count, double ppm, double z, double pmi)>();
+            foreach (var kv in counts)
+            {
+                if (!PassTextFilters(kv.Key, options.TextFilters, options.IgnoreCase)) continue;
+                if (!PassFrequencyFilters(kv.Value, options.FrequencyFilters)) continue;
+                list.Add((kv.Key, kv.Value, 0.0, 0.0, 0.0));
+            }
+
+            var finalList = SortAndLimit(list, options).ToList();
+            if (options.ShowSummary)
+                Console.WriteLine($"Count: {counts.Count} (unique), {finalList.Count} shown");
+            if (options.ShowSummary)
+                Console.WriteLine();
+
+            var cappedList = ApplyMaxItemsCap(finalList, options, options.Sort == SortDirection.Asc ? "ascending" : "descending", out var notice);
+            foreach (var it in cappedList) PrintEntry(it, options, "path-" + n);
+            if (notice != null) Console.WriteLine(notice);
+            Console.WriteLine();
+        }
     }
 
     static void PrintTfidf(CommandOptions options)
@@ -800,7 +955,9 @@ class Program
             foreach (var kv in perDocTf)
             {
                 var ngram = kv.Key;
-                if (!PassTextFilters(ngram, options.TextFilters)) continue;
+                if (!PassTextFilters(ngram, options.TextFilters, options.IgnoreCase)) continue;
+                if (!PassStopwordFilter(ngram, options)) continue;
+                if (!PassTrimFilter(ngram, options)) continue;
                 int totalCount = kv.Value.Values.Sum();
                 if (!PassFrequencyFilters(totalCount, options.FrequencyFilters)) continue;
 
@@ -845,7 +1002,31 @@ class Program
             }
             else
             {
+                // Rank documents by an aggregate per-file distinctiveness score (computed
+                // from this same n-gram size's rows) before deciding which ones get a full
+                // breakdown table — see CommandOptions.TopFiles/TopFilesBy. Mirrors the
+                // existing --max-items rank+cap+trailing-notice convention, one level up
+                // (files, not rows).
+                var docScores = new Dictionary<string, double>();
                 foreach (var docName in Program.DocumentNames)
+                {
+                    var docTfidfs = rows.Where(r => perDocTf[r.ngram].ContainsKey(docName))
+                        .Select(r => perDocTf[r.ngram][docName] * r.idf)
+                        .OrderByDescending(v => v)
+                        .ToList();
+                    double score;
+                    if (docTfidfs.Count == 0) score = 0;
+                    else if (options.TopFilesBy == "max") score = docTfidfs[0];
+                    else if (options.TopFilesBy == "sum") score = docTfidfs.Sum();
+                    else score = docTfidfs.Take(5).Average(); // "avg-top5" (default)
+                    docScores[docName] = score;
+                }
+
+                var rankedDocs = Program.DocumentNames.OrderByDescending(d => docScores[d]).ToList();
+                bool topFilesCapped = options.TopFiles < int.MaxValue && rankedDocs.Count > options.TopFiles;
+                var docsToShow = topFilesCapped ? rankedDocs.Take(options.TopFiles).ToList() : rankedDocs;
+
+                foreach (var docName in docsToShow)
                 {
                     var docRows = rows.Where(r => perDocTf[r.ngram].ContainsKey(docName))
                         .Select(r => (r.ngram, r.count, r.docFreq, r.idf, tfidf: perDocTf[r.ngram][docName] * r.idf))
@@ -860,21 +1041,38 @@ class Program
                         : tfidfFilteredDocRows.OrderByDescending(r => r.tfidf).ThenBy(r => r.ngram);
                     var limited = sorted.AsEnumerable();
                     if (options.Limit < int.MaxValue) limited = limited.Take(options.Limit);
-                    var limitedDocList = ApplyMaxItemsCap(limited.ToList(), options, options.Sort == SortDirection.Asc ? "ascending by tfidf" : "descending by tfidf", out var tfidfDocMaxItemsNotice);
+                    var limitedDocList = limited.ToList();
 
-                    Console.WriteLine($"### {docName}");
+                    // Per-file row cap (ngc-feedback.md #3): distinct from the global
+                    // --max-items cap below, and applied first — this is what actually keeps
+                    // `--per-file` output bounded when many files are selected, rather than
+                    // relying on the global cap (which used to apply once, per WHOLE run, not
+                    // per file, so N files could each print up to --max-items rows).
+                    bool perFileCapped = !HasExplicitLimit(options) && options.MaxItemsPerFile > 0 && limitedDocList.Count > options.MaxItemsPerFile;
+                    int totalBeforePerFileCap = limitedDocList.Count;
+                    if (perFileCapped) limitedDocList = limitedDocList.Take(options.MaxItemsPerFile).ToList();
+
+                    var afterPerFileCap = ApplyMaxItemsCap(limitedDocList, options, options.Sort == SortDirection.Asc ? "ascending by tfidf" : "descending by tfidf", out var tfidfDocMaxItemsNotice);
+
+                    string headerSuffix = perFileCapped ? $" — showing top {options.MaxItemsPerFile} of {totalBeforePerFileCap}" : "";
+                    Console.WriteLine($"### {docName} (rank score: {docScores[docName]:F2}, by {options.TopFilesBy}){headerSuffix}");
                     Console.WriteLine();
                     if (options.ShowColumnHeader)
                         Console.WriteLine("COUNT   DF      IDF     TFIDF   PHRASE");
 
                     if (options.ShowTfidfPhrases)
                     {
-                        foreach (var r in limitedDocList)
+                        foreach (var r in afterPerFileCap)
                             Console.WriteLine($"{r.count,-7} {r.docFreq,-7} {r.idf,-7:F2} {r.tfidf,-7:F2} {r.ngram}");
                     }
+                    if (perFileCapped)
+                        Console.WriteLine($"[showing top {options.MaxItemsPerFile} of {totalBeforePerFileCap} rows for this file — use `--max-items-per-file N` (0=unlimited) to see more]");
                     if (tfidfDocMaxItemsNotice != null) Console.WriteLine(tfidfDocMaxItemsNotice);
                     Console.WriteLine();
                 }
+
+                if (topFilesCapped)
+                    Console.WriteLine($"[showing top {options.TopFiles} of {rankedDocs.Count} files, ranked by {options.TopFilesBy} TF-IDF score — use `--top-files 0` for all]");
             }
         }
     }
@@ -931,6 +1129,7 @@ class Program
 
         // sortedFrequencies is sorted ascending; walk it once with a pointer per bucket
         int idx = 0;
+        int hapaxCount = 0; // freq==1 bucket, tracked separately for the annotation below
         foreach (var b in buckets)
         {
             int count = 0;
@@ -939,9 +1138,24 @@ class Program
                 if (sortedFrequencies[idx] >= b.lo) count++;
                 idx++;
             }
+            if (b.lo == 1 && b.hi == 1) hapaxCount = count;
             if (count == 0) continue;
             double pct = total > 0 ? (double)count / total * 100.0 : 0.0;
             Console.WriteLine($"{count,-9} {b.label,-11} {pct:F1}%");
+        }
+
+        // Annotate the freq=1 bucket in plain language: it's always the largest bucket in
+        // real text (Zipf's law), so a large percentage here is normal — not a sign of rich
+        // content. These "hapax legomena" (occur-exactly-once items) are disproportionately
+        // proper nouns, quoted examples, and one-off identifiers, not recurring vocabulary.
+        if (hapaxCount > 0 && total > 0)
+        {
+            double hapaxPct = (double)hapaxCount / total * 100.0;
+            Console.WriteLine();
+            Console.WriteLine($"Note: {hapaxPct:F1}% of unique items occur exactly once (\"hapax legomena\")");
+            Console.WriteLine("      — often one-off names/quotes/identifiers, not recurring patterns.");
+            Console.WriteLine("      This bucket is always the largest in real text (Zipf's law); a high");
+            Console.WriteLine("      percentage here is normal, not evidence of rich unique content.");
         }
     }
 
@@ -1320,16 +1534,88 @@ class Program
         Console.WriteLine($"{sb}{it.ngram}");
     }
 
-    static bool PassTextFilters(string ngram, List<TextFilter> filters)
+    // Drops an n-gram only if EVERY word in it is a stopword — mixed phrases like
+    // "the guard" or "state of the art" survive since they carry real content; only
+    // fully-function-word phrases like "to the" or "Do not" are filtered. Splits on the
+    // same separator the ngram was joined with (space for prose, "/" for path-segments).
+    // An empty EffectiveStopWords set (via --no-stop-words with no re-adds) naturally means
+    // "filter off" — no phrase can ever be all-stopwords against an empty set.
+    static bool PassStopwordFilter(string ngram, CommandOptions options, string separator = " ")
     {
-        string ngramLower = ngram.ToLower();
-        
+        if (options.EffectiveStopWords.Count == 0) return true;
+        var words = ngram.Split(new[] { separator }, StringSplitOptions.None);
+        foreach (var w in words)
+        {
+            if (!options.EffectiveStopWords.Contains(w)) return true; // at least one real word
+        }
+        return false; // every word was a stopword
+    }
+
+    // Drops an n-gram if its FIRST OR LAST word is a trim word — a stricter, position-
+    // sensitive sibling of PassStopwordFilter (see TrimWords.cs for why this is a genuinely
+    // different, smaller set rather than a reuse of StopWords). Kills glue phrases like
+    // "for the" / "the same" / "its own" (edge word carries no content) while preserving
+    // signal phrases like "not yet resolved" / "does not decide" (their edge words — "not",
+    // "does" — are deliberately excluded from TrimWords.Default even though they ARE
+    // stopwords). Single-word n-grams (n=1) are exempt: there's no separate "edge" to test.
+    // An empty EffectiveTrimWords set (via --no-trim-words with no re-adds) means "filter off".
+    static bool PassTrimFilter(string ngram, CommandOptions options, string separator = " ")
+    {
+        if (options.EffectiveTrimWords.Count == 0) return true;
+        var words = ngram.Split(new[] { separator }, StringSplitOptions.None);
+        if (words.Length < 2) return true; // nothing to "trim" on a single token
+        var first = words[0];
+        var last = words[words.Length - 1];
+        if (options.EffectiveTrimWords.Contains(first)) return false;
+        if (options.EffectiveTrimWords.Contains(last)) return false;
+        return true;
+    }
+
+
+    // Pre-tokenization corpus filter: decides whether a whole SOURCE LINE enters the
+    // token pool at all, BEFORE any n-grams are built from it. Distinct pipeline stage
+    // from PassTextFilters (which filters already-built n-gram PHRASE results after the
+    // fact) — see --line-contains/--remove-line-contains in --help. Reuses the same
+    // TextFilter.Contains/NotContains matching semantics against the whole line string.
+    static bool PassLineFilters(string line, List<TextFilter> filters, bool ignoreCase = false)
+    {
+        if (filters.Count == 0) return true;
+        var cmp = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var f in filters)
+        {
+            if (f.CompiledRegex != null)
+            {
+                bool match = f.CompiledRegex.IsMatch(line);
+                if (f.Type == TextFilter.TypeEnum.Contains && !match) return false;
+                if (f.Type == TextFilter.TypeEnum.NotContains && match) return false;
+                continue;
+            }
+            switch (f.Type)
+            {
+                case TextFilter.TypeEnum.Contains:
+                    if (line.IndexOf(f.Pattern, cmp) < 0) return false;
+                    break;
+                case TextFilter.TypeEnum.NotContains:
+                    if (line.IndexOf(f.Pattern, cmp) >= 0) return false;
+                    break;
+            }
+        }
+        return true;
+    }
+
+    static bool PassTextFilters(string ngram, List<TextFilter> filters, bool ignoreCase = false)    {
+        // Case sensitivity for the regex path is already baked into how the regex was
+        // compiled (see TryCompileRegex's ignoreCase param at parse time), so we match the
+        // raw ngram directly here — no pre-lowercasing, which would corrupt case-sensitive
+        // patterns like "[A-Z][a-z]+[A-Z]" by mangling the case of the text being matched.
+        var cmp = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
         foreach (var f in filters)
         {
             // If we have a compiled regex, use it for Contains and NotContains filters
             if (f.CompiledRegex != null)
             {
-                bool match = f.CompiledRegex.IsMatch(ngramLower);
+                bool match = f.CompiledRegex.IsMatch(ngram);
                 
                 switch (f.Type)
                 {
@@ -1354,22 +1640,22 @@ class Program
             switch (f.Type)
             {
                 case TextFilter.TypeEnum.Contains:
-                    if (!ngramLower.Contains(f.Pattern.ToLower())) return false;
+                    if (ngram.IndexOf(f.Pattern, cmp) < 0) return false;
                     break;
                 case TextFilter.TypeEnum.NotContains:
-                    if (ngramLower.Contains(f.Pattern.ToLower())) return false;
+                    if (ngram.IndexOf(f.Pattern, cmp) >= 0) return false;
                     break;
                 case TextFilter.TypeEnum.StartsWith:
-                    if (!ngramLower.StartsWith(f.Pattern.ToLower())) return false;
+                    if (!ngram.StartsWith(f.Pattern, cmp)) return false;
                     break;
                 case TextFilter.TypeEnum.NotStartsWith:
-                    if (ngramLower.StartsWith(f.Pattern.ToLower())) return false;
+                    if (ngram.StartsWith(f.Pattern, cmp)) return false;
                     break;
                 case TextFilter.TypeEnum.EndsWith:
-                    if (!ngramLower.EndsWith(f.Pattern.ToLower())) return false;
+                    if (!ngram.EndsWith(f.Pattern, cmp)) return false;
                     break;
                 case TextFilter.TypeEnum.NotEndsWith:
-                    if (ngramLower.EndsWith(f.Pattern.ToLower())) return false;
+                    if (ngram.EndsWith(f.Pattern, cmp)) return false;
                     break;
             }
         }
@@ -1485,18 +1771,28 @@ class Program
     {
         var options = new CommandOptions();
 
+        // --no-stop-words / --no-trim-words reset their respective set to empty as the
+        // STARTING BASIS, before any --stop-words/--trim-words additions are applied below.
+        // This pre-scan makes the two flags order-independent: "--stop-words x --no-stop-words"
+        // and "--no-stop-words --stop-words x" both end up with EffectiveStopWords == {x},
+        // regardless of which one appears first on the command line, because the reset
+        // always happens before the (order-preserving) additive pass in the main loop.
+        if (args.Contains("--no-stop-words")) options.EffectiveStopWords.Clear();
+        if (args.Contains("--no-trim-words")) options.EffectiveTrimWords.Clear();
+        // --ignore-case must be known before any --contains/--starts/--ends/etc. are parsed
+        // below, since it's baked into the compiled Regex at parse time (RegexOptions.IgnoreCase)
+        // — same order-independence concern as the two lines above.
+        if (args.Contains("--ignore-case")) options.IgnoreCase = true;
+
         // Used by --files parsing: decides where the glob list for --files ends,
         // i.e. the next recognized ngc token (n-gram size, filter prefix, keyword,
         // or anything starting with "-"/"--"). Everything before that is a glob.
         bool IsLikelyOptionToken(string tok)
         {
-            if (tok.StartsWith("-")) return true; // "--show-x", "--contains", "--", "---", etc.
-            if (tok == "+" || tok == "++" || tok == "+++") return true;
-            if (tok == "asc" || tok == "desc" || tok == "rev") return true;
+            if (tok.StartsWith("-")) return true; // "--show-x", "--contains", "--less", "--more++", etc.
             if (Regex.IsMatch(tok, @"^\d+$")) return true;                 // n-gram size
             if (Regex.IsMatch(tok, @"^\d+\.\.\d+$")) return true;          // n-gram range
             if (tok.Contains(",") && Regex.IsMatch(tok, @"^[\d,]+$")) return true; // n-gram list
-            if (Regex.IsMatch(tok, @"^(freq|ppm|z|pmi|tfidf|cdf|sort|top|bottom):")) return true;
             return false;
         }
 
@@ -1559,13 +1855,13 @@ class Program
             Console.WriteLine("INTERPRET WITH CAUTION: Frequency ≠ Importance, Sample ≠ Population");
             
             Console.WriteLine("\nQUICK START:");
-            Console.WriteLine("  ngc 1 top:30 rev             # Most frequent terms, highest to lowest");
-            Console.WriteLine("  ngc 2..3 --contains \"pattern\" rev       # 2-3 word phrases containing \"pattern\"");
-            Console.WriteLine("  ngc 1 cdf:5 +++              # Top/bottom 5% by frequency, with metrics");
-            Console.WriteLine("  ngc 1 --show-pdf             # Frequency histogram (how many words occur N times)");
-            Console.WriteLine("  ngc 1 --show-cdf             # Percentile ladder (cumulative distribution)");
-            Console.WriteLine("  ngc 2 --show-pmi rev top:20  # Bigrams glued together more than chance predicts");
-            Console.WriteLine("  ngc 1 --files \"*.md\" --show-tfidf rev   # Distinctive terms across many files");
+            Console.WriteLine("  ngc 1 --top 30 --desc                    # Most frequent terms, highest to lowest");
+            Console.WriteLine("  ngc 2..3 --contains \"pattern\" --desc     # 2-3 word phrases containing \"pattern\"");
+            Console.WriteLine("  ngc 1 --cdf 5 --more+++                  # Top/bottom 5% by frequency, with metrics");
+            Console.WriteLine("  ngc 1 --show-pdf                         # Frequency histogram (how many words occur N times)");
+            Console.WriteLine("  ngc 1 --show-cdf                         # Percentile ladder (cumulative distribution)");
+            Console.WriteLine("  ngc 2 --show-pmi --desc --top 20         # Bigrams glued together more than chance predicts");
+            Console.WriteLine("  ngc 1 --files \"*.md\" --show-tfidf --desc # Distinctive terms across many files");
             
             Console.WriteLine("\nINPUT SOURCE:");
             Console.WriteLine("  (stdin)                  # Default: read piped text as one combined blob");
@@ -1575,9 +1871,9 @@ class Program
             Console.WriteLine("                           # Everything else (PDF/CDF/PMI/etc.) still works,");
             Console.WriteLine("                           # computed across the combined token pool.");
             Console.WriteLine("  Examples:");
-            Console.WriteLine("    ngc 1 --files \"*.md\" top:20 rev");
-            Console.WriteLine("    ngc 2 --files \"src/**/*.cs\" \"docs/**/*.md\" rev");
-            Console.WriteLine("    ngc 1 --files \"../other-repo/**/*.cs\" top:20 rev   # relative ../ globs work");
+            Console.WriteLine("    ngc 1 --files \"*.md\" --top 20 --desc");
+            Console.WriteLine("    ngc 2 --files \"src/**/*.cs\" \"docs/**/*.md\" --desc");
+            Console.WriteLine("    ngc 1 --files \"../other-repo/**/*.cs\" --top 20 --desc   # relative ../ globs work");
             Console.WriteLine("  Notes:");
             Console.WriteLine("    - No --files and no piped stdin = immediate error (not a hang).");
             Console.WriteLine("    - `--files \"*.md\"` (no --files at all, or a glob with 0 matches) errors immediately too.");
@@ -1590,47 +1886,95 @@ class Program
             Console.WriteLine("\nCONTENT FILTERS (supports regex) — explicit flags ONLY, no bare/implicit");
             Console.WriteLine("syntax. This is deliberate: an unrecognized/mistyped token is now always");
             Console.WriteLine("an error, never silently absorbed as a no-op filter.");
+            Console.WriteLine("CASE-SENSITIVE BY DEFAULT (e.g. --contains \"class [A-Z]\" only matches real");
+            Console.WriteLine("capitalized identifiers). Pass --ignore-case for case-insensitive prose search.");
+            Console.WriteLine();
+            Console.WriteLine("TWO DIFFERENT FILTER STAGES — don't confuse them:");
+            Console.WriteLine("  --contains/--starts/--ends (and --phrase-contains, an explicit alias for");
+            Console.WriteLine("  --contains) match against the ASSEMBLED N-GRAM PHRASE — i.e. AFTER lines are");
+            Console.WriteLine("  tokenized and n-grams are built/counted. `^`/`$` anchor to that phrase, NOT");
+            Console.WriteLine("  to the original source line — `--contains \"^Guard\"` matches n-grams whose");
+            Console.WriteLine("  FIRST WORD is \"Guard\", not lines containing a \"## Guard\" heading.");
+            Console.WriteLine("  --line-contains/--remove-line-contains match against the whole RAW SOURCE");
+            Console.WriteLine("  LINE, BEFORE tokenization — use this to restrict which lines even enter the");
+            Console.WriteLine("  n-gram pool at all (e.g. only lines mentioning \"Status\").");
+            Console.WriteLine();
+            Console.WriteLine("TOKENIZATION NOTE: Markdown syntax characters (`#`, backticks, etc.) are NOT");
+            Console.WriteLine("preserved as part of any word/phrase — a line like \"## Guard\" tokenizes to");
+            Console.WriteLine("the bare word \"Guard\" (the \"##\" is discarded), so `--contains \"## Guard\"`");
+            Console.WriteLine("will never match anything; use `--contains \"^Guard$\"` (n=1) instead, or");
+            Console.WriteLine("`--line-contains \"## Guard\"` to filter on the literal raw line text.");
+            Console.WriteLine();
+            Console.WriteLine("APOSTROPHE NOTE: possessives and contractions stay glued as ONE token —");
+            Console.WriteLine("\"Android's\", \"don't\", \"isn't\" tokenize whole, not as \"Android\"+\"s\" or");
+            Console.WriteLine("\"don\"+\"t\". Genuine single-quoted spans ('like this') are still detected and");
+            Console.WriteLine("kept as one atomic unit; the difference is a letter/digit immediately touching");
+            Console.WriteLine("the quote mark on at least one side (a possessive/contraction), vs. whitespace/");
+            Console.WriteLine("punctuation on both sides (a real quoted phrase).");
             Console.WriteLine("    --contains \"pattern\"        # Include phrases containing \"pattern\"");
             Console.WriteLine("    --remove-contains \"pattern\" # Exclude phrases containing \"pattern\"");
+            Console.WriteLine("    --phrase-contains \"pattern\" # Explicit alias for --contains (same thing)");
             Console.WriteLine("    --starts \"pattern\"          # Include phrases starting with \"pattern\"");
             Console.WriteLine("    --remove-starts \"pattern\"   # Exclude phrases starting with \"pattern\"");
             Console.WriteLine("    --ends \"pattern\"            # Include phrases ending with \"pattern\"");
             Console.WriteLine("    --remove-ends \"pattern\"     # Exclude phrases ending with \"pattern\"");
+            Console.WriteLine("    --line-contains \"pattern\"        # Only tokenize lines containing \"pattern\"");
+            Console.WriteLine("    --remove-line-contains \"pattern\" # Skip tokenizing lines containing \"pattern\"");
             Console.WriteLine("    --exclude-file file.txt     # Exclude phrases containing any term listed in file");
+            Console.WriteLine("    --ignore-case               # Make ALL of the above case-insensitive");
+            
+            Console.WriteLine("\nSTOPWORDS — dropped if EVERY word in the phrase is a stopword (on by default).");
+            Console.WriteLine("Mixed phrases like \"the guard\" survive (real content present); only");
+            Console.WriteLine("all-function-word phrases like \"to the\" or \"is not\" are filtered:");
+            Console.WriteLine("    --no-stop-words              # Reset the stopword set to EMPTY (filter off)");
+            Console.WriteLine("    --stop-words L1 md cycod    # ADD words to the CURRENT set (defaults, or");
+            Console.WriteLine("                                 # empty if --no-stop-words also given — order");
+            Console.WriteLine("                                 # on the command line doesn't matter)");
+            Console.WriteLine("    (--stop is a short alias for --stop-words)");
+            Console.WriteLine("    e.g. --no-stop-words --stop-words foo bar   => stopword set is JUST {foo, bar}");
+            Console.WriteLine("");
+            Console.WriteLine("TRIM WORDS — dropped if the FIRST OR LAST word is a trim word (on by default).");
+            Console.WriteLine("A stricter, position-sensitive sibling of stopwords: kills glue phrases like");
+            Console.WriteLine("\"for the\" / \"the same\" / \"its own\" (edge word carries no content), while");
+            Console.WriteLine("preserving signal phrases like \"not yet resolved\" / \"does not decide\" (\"not\"/");
+            Console.WriteLine("\"does\" are real stopwords but deliberately EXCLUDED from the trim-word set,");
+            Console.WriteLine("since negation/modals/wh-words routinely ARE the content at a phrase edge):");
+            Console.WriteLine("    --no-trim-words              # Reset the trim-word set to EMPTY (filter off)");
+            Console.WriteLine("    --trim-words foo bar         # ADD words to the CURRENT set, same semantics");
+            Console.WriteLine("                                 # as --stop-words above");
+            Console.WriteLine("    (--trim is a short alias for --trim-words)");
             
             Console.WriteLine("\nFREQUENCY FILTERS:");
-            Console.WriteLine("  (all of these also work as `--freq VALUE`, e.g. `--freq 10+` == `freq:10+`)");
-            Console.WriteLine("  freq:10+    # Frequency ≥ 10 occurrences");
-            Console.WriteLine("  freq:5..20  # Between 5 and 20 occurrences");
-            Console.WriteLine("  freq:..20   # Frequency ≤ 20 occurrences");
-            Console.WriteLine("  freq:!10+   # Less than 10 occurrences");
-            Console.WriteLine("  freq:!5..20 # Outside the range 5-20 occurrences");
-            Console.WriteLine("  freq:10     # Exactly 10 occurrences");
+            Console.WriteLine("  --freq 10+     # Frequency ≥ 10 occurrences");
+            Console.WriteLine("  --freq 5..20   # Between 5 and 20 occurrences");
+            Console.WriteLine("  --freq ..20    # Frequency ≤ 20 occurrences");
+            Console.WriteLine("  --freq !10+    # Less than 10 occurrences");
+            Console.WriteLine("  --freq !5..20  # Outside the range 5-20 occurrences");
+            Console.WriteLine("  --freq 10      # Exactly 10 occurrences");
             
             Console.WriteLine("\nDESCRIPTIVE FILTERS (apply to YOUR input only):");
-            Console.WriteLine("  (cdf/ppm/z/pmi/tfidf also work as `--cdf VALUE`, `--ppm VALUE`, etc.)");
-            Console.WriteLine("  cdf:90+     # Top 10% most frequent items (was 'percentile:', renamed)");
-            Console.WriteLine("  cdf:..50    # Bottom 50% of items");
-            Console.WriteLine("  cdf:25..75  # Middle 50% of items (interquartile range)");
-            Console.WriteLine("  cdf:!25..75 # Outside the middle range (potential outliers)");
-            Console.WriteLine("  cdf:5       # Top/bottom 5% by frequency in YOUR input (not 'outliers')");
+            Console.WriteLine("  --cdf 90+      # Top 10% most frequent items (was 'percentile:', renamed)");
+            Console.WriteLine("  --cdf ..50     # Bottom 50% of items");
+            Console.WriteLine("  --cdf 25..75   # Middle 50% of items (interquartile range)");
+            Console.WriteLine("  --cdf !25..75  # Outside the middle range (potential outliers)");
+            Console.WriteLine("  --cdf 5        # Top/bottom 5% by frequency in YOUR input (not 'outliers')");
             Console.WriteLine("  ");
-            Console.WriteLine("  ppm:1000+          # At least 1000 occurrences per million tokens");
-            Console.WriteLine("  ppm:500..1000      # Between 500-1000 occurrences per million");
-            Console.WriteLine("  ppm:..100          # At most 100 occurrences per million");
+            Console.WriteLine("  --ppm 1000+        # At least 1000 occurrences per million tokens");
+            Console.WriteLine("  --ppm 500..1000    # Between 500-1000 occurrences per million");
+            Console.WriteLine("  --ppm ..100        # At most 100 occurrences per million");
             Console.WriteLine("  ");
-            Console.WriteLine("  z:2                # Within 2 standard deviations of mean (typical)");
-            Console.WriteLine("  z:!2               # Outside 2 standard deviations (unusual)");
+            Console.WriteLine("  --z 2              # Within 2 standard deviations of mean (typical)");
+            Console.WriteLine("  --z !2             # Outside 2 standard deviations (unusual)");
             Console.WriteLine("  ");
-            Console.WriteLine("  pmi:2+             # Pointwise Mutual Information ≥ 2 (occurs ≥4x more than");
+            Console.WriteLine("  --pmi 2+           # Pointwise Mutual Information ≥ 2 (occurs ≥4x more than");
             Console.WriteLine("                     # chance predicts from the words' own frequencies — a real");
             Console.WriteLine("                     # \"glued together\" collocation, e.g. \"customer obsession\")");
-            Console.WriteLine("  pmi:!0             # PMI below 0 (occurs LESS than chance — anti-collocation)");
+            Console.WriteLine("  --pmi !0           # PMI below 0 (occurs LESS than chance — anti-collocation)");
             Console.WriteLine("                     # Only meaningful for n-grams with n >= 2.");
             Console.WriteLine("  ");
-            Console.WriteLine("  tfidf:20+          # TF-IDF score ≥ 20 (requires --files + --show-tfidf)");
-            Console.WriteLine("  tfidf:5..50        # TF-IDF between 5 and 50");
-            Console.WriteLine("  tfidf:..10         # TF-IDF ≤ 10 (common-everywhere terms, low distinctiveness)");
+            Console.WriteLine("  --tfidf 20+        # TF-IDF score ≥ 20 (requires --files + --show-tfidf)");
+            Console.WriteLine("  --tfidf 5..50      # TF-IDF between 5 and 50");
+            Console.WriteLine("  --tfidf ..10       # TF-IDF ≤ 10 (common-everywhere terms, low distinctiveness)");
             
             Console.WriteLine("\nSHOW / HIDE FLAGS (fine-grained control over report sections & columns):");
             Console.WriteLine("  Report sections:");
@@ -1653,9 +1997,10 @@ class Program
             Console.WriteLine("    --show-cdf / --hide-cdf");
             Console.WriteLine("    --show-pmi / --hide-pmi     # adds a PMI column to phrase rows");
             Console.WriteLine("    --show-tfidf / --hide-tfidf # requires --files");
+            Console.WriteLine("    --show-path-ngrams / --hide-path-ngrams # separate report, path-like units only");
             Console.WriteLine("  ");
-            Console.WriteLine("  Explicit flags always override whatever a preset (+/++/+++/--/---) set,");
-            Console.WriteLine("  regardless of order, e.g.:  ngc 1 +++ --hide-z   (detailed, but no Z column)");
+            Console.WriteLine("  Explicit flags always override whatever a preset (--more/--more++/--more+++/--less/--less--) set,");
+            Console.WriteLine("  regardless of order, e.g.:  ngc 1 --more+++ --hide-z   (detailed, but no Z column)");
             
             Console.WriteLine("\nREPORTS (new views beyond the phrase list):");
             Console.WriteLine("  --show-pdf   # Frequency histogram: how many distinct n-grams occur exactly");
@@ -1680,78 +2025,121 @@ class Program
             Console.WriteLine("  --per-file   # Modifier: instead of one aggregate table, break the report");
             Console.WriteLine("               # (currently --show-tfidf) into one table per matched file —");
             Console.WriteLine("               # that file's own top distinctive terms. Requires --files.");
+            Console.WriteLine("  ");
+            Console.WriteLine("  --top-files N       # With --per-file: only show breakdown tables for the N");
+            Console.WriteLine("                      # most distinctive files (ranked by an aggregate TF-IDF");
+            Console.WriteLine("                      # score — see --top-files-by), not all matched files.");
+            Console.WriteLine("                      # --top-files 0 = unlimited (default: show all files).");
+            Console.WriteLine("                      # Mirrors --max-items's rank+cap+trailing-notice pattern,");
+            Console.WriteLine("                      # one level up (files, not phrase-rows).");
+            Console.WriteLine("  --top-files-by MODE # How to rank each file's distinctiveness for --top-files:");
+            Console.WriteLine("                      #   avg-top5 (default) - avg of the file's top 5 TF-IDF");
+            Console.WriteLine("                      #     terms; robust, rewards several distinctive terms");
+            Console.WriteLine("                      #   max      - the file's single highest TF-IDF term;");
+            Console.WriteLine("                      #     cheap, but one outlier term can dominate");
+            Console.WriteLine("                      #   sum      - sum of all the file's TF-IDF terms;");
+            Console.WriteLine("                      #     rewards breadth of distinctiveness");
+            Console.WriteLine("  ");
+            Console.WriteLine("  --show-path-ngrams # N-grams built from the interior segments of path-like");
+            Console.WriteLine("               # units (e.g. \"src/whatever/services\" -> \"src/whatever\",");
+            Console.WriteLine("               # \"whatever/services\"). A SEPARATE namespace/section from the");
+            Console.WriteLine("               # main n-gram report: path-segment adjacency reflects directory");
+            Console.WriteLine("               # nesting, not English word order, so it's never merged into");
+            Console.WriteLine("               # regular phrase n-grams (which correctly treat a whole path as");
+            Console.WriteLine("               # ONE opaque slot, never fragmenting it into fake phrases).");
             
             Console.WriteLine("\nOUTPUT OPTIONS - a single monotonic verbosity ladder (each level a strict");
-            Console.WriteLine("superset of the previous one: more '+' = more detail, more '-' = less detail.");
-            Console.WriteLine("These are presets/aliases for bundles of the --show/--hide flags above, and");
-            Console.WriteLine("apply uniformly across ALL sections (n-grams, PDF, CDF, PMI, TF-IDF):");
-            Console.WriteLine("  ---                # Ultra-minimal: bare phrase only, nothing else");
-            Console.WriteLine("  --                 # Minimal: phrase + count only");
+            Console.WriteLine("superset of the previous one: more '--more's = more detail, more '--less's =");
+            Console.WriteLine("less detail. These are presets/aliases for bundles of the --show/--hide flags");
+            Console.WriteLine("above, and apply uniformly across ALL sections (n-grams, PDF, CDF, PMI, TF-IDF).");
+            Console.WriteLine("Every ngc argument starts with \"--\" — there is no bare/colon-form syntax:");
+            Console.WriteLine("  --less--           # Ultra-minimal: bare phrase only, nothing else");
+            Console.WriteLine("  --less             # Minimal: phrase + count only");
             Console.WriteLine("  (default)          # phrase + count + summary/freq-stats/section-header");
-            Console.WriteLine("  +                  # default + ppm column, ppm-stats, column-header");
-            Console.WriteLine("  ++                 # '+' + merged section (compare multiple n-gram sizes)");
-            Console.WriteLine("  +++                # '++' + z-score column (full detail)");
+            Console.WriteLine("  --more             # default + ppm column, ppm-stats, column-header");
+            Console.WriteLine("  --more++           # '--more' + merged section (compare multiple n-gram sizes)");
+            Console.WriteLine("  --more+++          # '--more++' + z-score column (full detail)");
             Console.WriteLine("  ");
             Console.WriteLine("  Explicit --show-x/--hide-x flags always override whatever a preset set,");
-            Console.WriteLine("  regardless of order, e.g.:  ngc 1 +++ --hide-z   (detailed, but no Z column)");
+            Console.WriteLine("  regardless of order, e.g.:  ngc 1 --more+++ --hide-z   (detailed, but no Z column)");
             Console.WriteLine("  ");
-            Console.WriteLine("  --asc / asc             # Sort ascending (least frequent first)");
-            Console.WriteLine("  --desc / --rev / desc/rev # Sort descending (most frequent first)");
-            Console.WriteLine("  --sort count / sort:count # Sort by raw count (default)");
-            Console.WriteLine("  --sort ppm / sort:ppm     # Sort by normalized frequency (parts per million - NOT statistical significance!)");
+            Console.WriteLine("  --asc                     # Sort ascending (least frequent first)");
+            Console.WriteLine("  --desc / --rev            # Sort descending (most frequent first)");
+            Console.WriteLine("  --sort count              # Sort by raw count (default)");
+            Console.WriteLine("  --sort ppm                # Sort by normalized frequency (parts per million - NOT statistical significance!)");
             Console.WriteLine("  ");
-            Console.WriteLine("  --top 50 / top:50       # Show only top 50 most frequent results");
-            Console.WriteLine("  --top 10% / top:10%     # Show top 10% of results");
-            Console.WriteLine("  --bottom 20 / bottom:20 # Show only bottom 20 least frequent results");
-            Console.WriteLine("  --bottom 25% / bottom:25% # Show bottom 25% of results");
-            Console.WriteLine("  (top:N/bottom:N tie-expand to include all items tied with the boundary count —");
-            Console.WriteLine("   but only when sorting by raw count. With sort:ppm, N is honored exactly, since");
-            Console.WriteLine("   ppm is continuous and long-tail text can have thousands of items tied at the");
-            Console.WriteLine("   same low ppm, which would otherwise blow top:N out to nearly the whole list.)");
-            Console.WriteLine("  ");
-            Console.WriteLine("  (--freq/--ppm/--z/--pmi/--tfidf/--cdf all have '--flag VALUE' forms too,");
-            Console.WriteLine("   e.g. `--freq 10+` is the same as `freq:10+` — pick whichever reads better.)");
+            Console.WriteLine("  --top 50                # Show only top 50 most frequent results");
+            Console.WriteLine("  --top 10%               # Show top 10% of results");
+            Console.WriteLine("  --bottom 20             # Show only bottom 20 least frequent results");
+            Console.WriteLine("  --bottom 25%            # Show bottom 25% of results");
+            Console.WriteLine("  (--top N/--bottom N tie-expand to include all items tied with the boundary");
+            Console.WriteLine("   count — but only when sorting by raw count. With --sort ppm, N is honored");
+            Console.WriteLine("   exactly, since ppm is continuous and long-tail text can have thousands of");
+            Console.WriteLine("   items tied at the same low ppm, which would otherwise blow --top N out to");
+            Console.WriteLine("   nearly the whole list.)");
             Console.WriteLine("  ");
             Console.WriteLine("  --max-items 200    # Default cap on phrase rows per section when you have");
-            Console.WriteLine("                     # not given an explicit top:/bottom:. If the filtered");
+            Console.WriteLine("                     # not given an explicit --top/--bottom. If the filtered");
             Console.WriteLine("                     # result set is bigger, ngc trims it and prints a notice");
             Console.WriteLine("                     # (at the END of the list, after it scrolls) telling you");
             Console.WriteLine("                     # how to see more.");
             Console.WriteLine("  --max-items 0      # Unlimited - never trim, no matter how big the result set");
+            Console.WriteLine("  --max-items-per-file 15  # Default cap on rows shown WITHIN EACH FILE's own");
+            Console.WriteLine("                           # table under --show-tfidf --per-file, independent");
+            Console.WriteLine("                           # of --max-items above (which is a GLOBAL cap, not");
+            Console.WriteLine("                           # a per-file one). Each capped file's header shows");
+            Console.WriteLine("                           # \"(showing top N of M)\" so it's clear which file");
+            Console.WriteLine("                           # tables were trimmed vs. shown in full.");
+            Console.WriteLine("  --max-items-per-file 0   # Unlimited rows per file");
             
             Console.WriteLine("\nANALYSIS STRATEGIES:");
             Console.WriteLine("  ");
             Console.WriteLine("  # Exploratory Analysis (Start Here)");
-            Console.WriteLine("  ngc 1 top:30 rev                    # Most frequent terms in your input");
-            Console.WriteLine("  ngc 2 cdf:95+ rev                   # Top 5% most frequent phrases in your input");
-            Console.WriteLine("  ngc 1 cdf:5 rev +++                 # Top/bottom 5% by frequency, with metrics");
+            Console.WriteLine("  ngc 1 --top 30 --desc                    # Most frequent terms in your input");
+            Console.WriteLine("  ngc 2 --cdf 95+ --desc                   # Top 5% most frequent phrases in your input");
+            Console.WriteLine("  ngc 1 --cdf 5 --desc --more+++           # Top/bottom 5% by frequency, with metrics");
             Console.WriteLine("  ngc 1 --show-pdf                    # See the overall shape of the distribution");
             Console.WriteLine("  ");
             Console.WriteLine("  # Collocation / Phrase Discovery");
-            Console.WriteLine("  ngc 2 --show-pmi rev top:30          # Which bigrams are 'real phrases', not chance");
-            Console.WriteLine("  ngc 3 --show-pmi pmi:2+ freq:5+ rev  # Strongly glued trigrams, filtered to real signal");
+            Console.WriteLine("  ngc 2 --show-pmi --desc --top 30          # Which bigrams are 'real phrases', not chance");
+            Console.WriteLine("  ngc 3 --show-pmi --pmi 2+ --freq 5+ --desc  # Strongly glued trigrams, filtered to real signal");
             Console.WriteLine("  ");
             Console.WriteLine("  # Distinctiveness Across Documents (requires --files)");
-            Console.WriteLine("  ngc 2 --files \"*.md\" --show-tfidf rev top:30   # What's distinctive, not just frequent");
+            Console.WriteLine("  ngc 2 --files \"*.md\" --show-tfidf --desc --top 30   # What's distinctive, not just frequent");
             Console.WriteLine("  ngc 2 --files \"*.md\" --show-tfidf --per-file   # Each file's own top distinctive terms");
             Console.WriteLine("  ");
+            Console.WriteLine("  # Real-Term / Glossary Extraction (surface form, not statistics)");
+            Console.WriteLine("  # PMI/TF-IDF above are great at finding TEMPLATE/structural patterns (repeated");
+            Console.WriteLine("  # boilerplate phrases), but they routinely bury genuine domain vocabulary under");
+            Console.WriteLine("  # common connective phrases. For an actual glossary of real identifiers/terms,");
+            Console.WriteLine("  # exploit surface form instead of frequency — e.g. PascalCase/CamelCase is a");
+            Console.WriteLine("  # strong signal for \"this is a real API/class/service name,\" not English prose.");
+            Console.WriteLine("  # Requires case-sensitive matching (the ngc default) — see CASE-SENSITIVE note above.");
+            Console.WriteLine("  ngc 1 --contains \"^[A-Z][a-z]+[A-Z]\" --freq 2+ --desc --top 30");
+            Console.WriteLine("                                       # PascalCase identifiers (ClassNames,");
+            Console.WriteLine("                                       # ServiceNames, MethodNames) sorted by");
+            Console.WriteLine("                                       # mention count — an instant glossary of");
+            Console.WriteLine("                                       # every real technical term in the corpus,");
+            Console.WriteLine("                                       # with zero prior vocabulary knowledge needed");
+            Console.WriteLine("  ngc 1 --contains \"^[A-Z]{2,}$\" --freq 2+ --desc     # ALL-CAPS acronyms/constants");
+            Console.WriteLine("    ");
             Console.WriteLine("  # Code Structure Analysis");
-            Console.WriteLine("  ngc 2 --contains \"class [A-Z]\" rev             # Find class definitions");
-            Console.WriteLine("  ngc 3 --contains \"public (class|interface)\" rev # Find public type definitions");
-            Console.WriteLine("  ngc 3 --contains \"new [A-Z]\" sort:ppm rev      # Object instantiation by normalized frequency");
-            Console.WriteLine("  ngc 2 --contains \"import|using\" top:20 rev     # Most frequent dependencies");
+            Console.WriteLine("  ngc 2 --contains \"class [A-Z]\" --desc             # Find class definitions");
+            Console.WriteLine("  ngc 3 --contains \"public (class|interface)\" --desc # Find public type definitions");
+            Console.WriteLine("  ngc 3 --contains \"new [A-Z]\" --sort ppm --desc      # Object instantiation by normalized frequency");
+            Console.WriteLine("  ngc 2 --contains \"import|using\" --top 20 --desc     # Most frequent dependencies");
             Console.WriteLine("  ");
             Console.WriteLine("  # Frequency Pattern Discovery");
-            Console.WriteLine("  ngc 3 --contains \"if\" z:!2 freq:5+ rev         # 'if' patterns >2 std devs from mean, 5+ occurrences");
-            Console.WriteLine("  ngc 2 --contains \"null\" cdf:95+ rev            # Top 5% most frequent null-related patterns");
-            Console.WriteLine("  ngc 3 --contains \"try catch\" sort:ppm rev      # Error handling patterns by normalized frequency");
-            Console.WriteLine("  ngc 2 --contains \"TODO|FIXME\" rev              # Find technical debt markers");
+            Console.WriteLine("  ngc 3 --contains \"if\" --z !2 --freq 5+ --desc         # 'if' patterns >2 std devs from mean, 5+ occurrences");
+            Console.WriteLine("  ngc 2 --contains \"null\" --cdf 95+ --desc            # Top 5% most frequent null-related patterns");
+            Console.WriteLine("  ngc 3 --contains \"try catch\" --sort ppm --desc      # Error handling patterns by normalized frequency");
+            Console.WriteLine("  ngc 2 --contains \"TODO|FIXME\" --desc              # Find technical debt markers");
             Console.WriteLine("  ");
             Console.WriteLine("  # Documentation Analysis");
-            Console.WriteLine("  ngc 3 --contains \"should\" cdf:80+ rev          # Top 20% frequent 'should' phrases");
-            Console.WriteLine("  ngc 2 --remove-contains \"^(the|a|an|of|in)$\" cdf:95+   # Frequent terms excluding common words");
-            Console.WriteLine("  ngc 3 --contains \"Inconsistencies|Issues\" rev  # Find problem-related phrases");
-            Console.WriteLine("  ngc 2 --contains \"is|are\" z:!2 freq:5+ +++     # Definition patterns >2 std devs, with metrics");
+            Console.WriteLine("  ngc 3 --contains \"should\" --cdf 80+ --desc          # Top 20% frequent 'should' phrases");
+            Console.WriteLine("  ngc 2 --remove-contains \"^(the|a|an|of|in)$\" --cdf 95+   # Frequent terms excluding common words");
+            Console.WriteLine("  ngc 3 --contains \"Inconsistencies|Issues\" --desc  # Find problem-related phrases");
+            Console.WriteLine("  ngc 2 --contains \"is|are\" --z !2 --freq 5+ --more+++     # Definition patterns >2 std devs, with metrics");
             
             Console.WriteLine("\nTROUBLESHOOTING:");
             Console.WriteLine("  ");
@@ -1765,22 +2153,22 @@ class Program
             Console.WriteLine("  # For better results:");
             Console.WriteLine("  1. Increase sample size: More diverse input = more generalizable patterns");
             Console.WriteLine("  2. Document your input source: What repos/files did you analyze?");
-            Console.WriteLine("  3. Use '+++' to see full metrics when results seem incorrect");
+            Console.WriteLine("  3. Use '--more+++' to see full metrics when results seem incorrect");
             Console.WriteLine("  4. Validate against different samples: Same pattern in diverse sources = stronger evidence");
             
             Console.WriteLine("\nCOMMON COMBINATIONS:");
-            Console.WriteLine("  ngc 1..3 cdf:5 rev                  # Statistical outliers across different n-gram sizes");
-            Console.WriteLine("  ngc 2 --remove-contains \"^(the|a|an|of|in)$\" sort:ppm  # Meaningful phrases sorted by statistical significance");
-            Console.WriteLine("  ngc 3 --contains \"pattern\" z:!2 freq:5+        # Unusual but recurring patterns containing \"pattern\"");
-            Console.WriteLine("  ngc 2..3 z:!2 freq:5+ ++            # Statistically significant phrases of different lengths");
-            Console.WriteLine("  ngc 2 --files \"*.md\" --show-tfidf --show-pmi rev  # Distinctive AND glued-together phrases");
+            Console.WriteLine("  ngc 1..3 --cdf 5 --desc                  # Statistical outliers across different n-gram sizes");
+            Console.WriteLine("  ngc 2 --remove-contains \"^(the|a|an|of|in)$\" --sort ppm  # Meaningful phrases sorted by statistical significance");
+            Console.WriteLine("  ngc 3 --contains \"pattern\" --z !2 --freq 5+        # Unusual but recurring patterns containing \"pattern\"");
+            Console.WriteLine("  ngc 2..3 --z !2 --freq 5+ --more++            # Statistically significant phrases of different lengths");
+            Console.WriteLine("  ngc 2 --files \"*.md\" --show-tfidf --show-pmi --desc  # Distinctive AND glued-together phrases");
             
             Console.WriteLine("\nTIPS FOR EFFECTIVE ANALYSIS:");
-            Console.WriteLine("  1. Start broad, then narrow: Begin with `ngc 1 top:50 rev` to get an overview");
-            Console.WriteLine("  2. Use cdf filters for deeper insights: `cdf:5` is more revealing than just `top:N`");
-            Console.WriteLine("  3. Look for both common and rare patterns: Outliers (`z:!2`) often reveal key insights");
+            Console.WriteLine("  1. Start broad, then narrow: Begin with `ngc 1 --top 50 --desc` to get an overview");
+            Console.WriteLine("  2. Use cdf filters for deeper insights: `--cdf 5` is more revealing than just `--top N`");
+            Console.WriteLine("  3. Look for both common and rare patterns: Outliers (`--z !2`) often reveal key insights");
             Console.WriteLine("  4. Combine with grep for further filtering: Pipe ngc output to grep to find specific terms");
-            Console.WriteLine("  5. Statistical metrics reveal more than raw counts: Use `+++` and `sort:ppm` to find significance");
+            Console.WriteLine("  5. Statistical metrics reveal more than raw counts: Use `--more+++` and `--sort ppm` to find significance");
             Console.WriteLine("  6. Use --show-pmi to separate 'real phrases' from words that are merely common individually");
             Console.WriteLine("  7. Use --files + --show-tfidf to separate 'distinctive to a document' from 'common everywhere'");
 
@@ -1797,23 +2185,10 @@ class Program
         {
             var a = args[i];
 
-            // Normalize the "--flag VALUE" form into the existing "flag:VALUE" token so all
-            // existing parsing below (top:, bottom:, freq:, ppm:, z:, pmi:, tfidf:, cdf:, sort:)
-            // keeps working unchanged for both spellings. The bare colon-form still works too.
-            var valueFlagToColonPrefix = new Dictionary<string, string> {
-                { "--top", "top:" }, { "--bottom", "bottom:" }, { "--sort", "sort:" },
-                { "--freq", "freq:" }, { "--ppm", "ppm:" }, { "--z", "z:" },
-                { "--pmi", "pmi:" }, { "--tfidf", "tfidf:" }, { "--cdf", "cdf:" },
-            };
-            if (valueFlagToColonPrefix.TryGetValue(a, out var colonPrefix) && i + 1 < args.Length)
-            {
-                i++;
-                a = colonPrefix + args[i];
-            }
-            else if (a == "--asc") { a = "asc"; }
-            else if (a == "--desc" || a == "--rev") { a = "rev"; }
+            if (a == "--asc") { options.Sort = SortDirection.Asc; continue; }
+            if (a == "--desc" || a == "--rev") { options.Sort = SortDirection.Desc; continue; }
 
-            if (a == "---") {
+            if (a == "--less--") {
                 // Ultra-minimal: bare phrase only. Strict subset of everything else.
                 options.MinimalOutput = true;
                 options.ShowInput = false;
@@ -1828,7 +2203,7 @@ class Program
                 options.ShowMerged = false;
                 continue;
             }
-            if (a == "--") {
+            if (a == "--less") {
                 // Minimal: phrase + count only, no stats/headers.
                 options.MinimalOutput = true;
                 options.ShowInput = false;
@@ -1843,7 +2218,7 @@ class Program
                 options.ShowMerged = false;
                 continue;
             }
-            if (a == "+") {
+            if (a == "--more") {
                 // Default + ppm column, ppm stats, column header.
                 options.Mode = OutputMode.Enhanced;
                 options.ShowPpm = true;
@@ -1851,8 +2226,8 @@ class Program
                 options.ShowColumnHeader = true;
                 continue;
             }
-            if (a == "++") {
-                // '+' plus a merged section combining multiple n-gram sizes.
+            if (a == "--more++") {
+                // '--more' plus a merged section combining multiple n-gram sizes.
                 options.Mode = OutputMode.Both;
                 options.ShowMerged = true;
                 options.ShowPpm = true;
@@ -1860,8 +2235,8 @@ class Program
                 options.ShowColumnHeader = true;
                 continue;
             }
-            if (a == "+++") {
-                // '++' plus the Z-score column (full detail — the "kitchen sink").
+            if (a == "--more+++") {
+                // '--more++' plus the Z-score column (full detail — the "kitchen sink").
                 options.Mode = OutputMode.Detailed;
                 options.ShowMerged = true;
                 options.ShowPpm = true;
@@ -1904,7 +2279,59 @@ class Program
             if (a == "--hide-pmi") { options.ShowPmi = false; continue; }
             if (a == "--show-tfidf") { options.ShowTfidf = true; continue; }
             if (a == "--hide-tfidf") { options.ShowTfidf = false; continue; }
+            if (a == "--show-path-ngrams") { options.ShowPathNGrams = true; continue; }
+            if (a == "--hide-path-ngrams") { options.ShowPathNGrams = false; continue; }
             if (a == "--per-file") { options.PerFile = true; continue; }
+            if (a == "--no-stop-words")
+            {
+                // Basis reset is handled by the pre-scan before this loop runs (see ParseArgs
+                // top); this token is consumed here just so it doesn't fall through to the
+                // "unrecognized option" error path. No further action needed at this point.
+                continue;
+            }
+            if (a == "--ignore-case")
+            {
+                // Also handled by the pre-scan (see ParseArgs top); consumed here as a no-op.
+                continue;
+            }
+            if (a == "--stop-words" || a == "--stop")
+            {
+                // --stop-words word1 word2 ...: ADD extra words to the stopword set, on top
+                // of whichever basis is currently in effect (full defaults, or empty if
+                // --no-stop-words was also given — order on the command line doesn't matter,
+                // see the pre-scan in ParseArgs). Bare --stop-words with no following words
+                // is a no-op (nothing to add).
+                int j = i + 1;
+                var added = new List<string>();
+                while (j < args.Length && !IsLikelyOptionToken(args[j]))
+                {
+                    added.Add(args[j]);
+                    j++;
+                }
+                foreach (var w in added) options.EffectiveStopWords.Add(w);
+                i = j - 1;
+                continue;
+            }
+            if (a == "--no-trim-words")
+            {
+                // Same pre-scan pattern as --no-stop-words; consumed here as a no-op.
+                continue;
+            }
+            if (a == "--trim-words" || a == "--trim")
+            {
+                // --trim-words word1 word2 ...: ADD extra words to the trim-word set, on top
+                // of whichever basis is currently in effect. Symmetric with --stop-words.
+                int j = i + 1;
+                var added = new List<string>();
+                while (j < args.Length && !IsLikelyOptionToken(args[j]))
+                {
+                    added.Add(args[j]);
+                    j++;
+                }
+                foreach (var w in added) options.EffectiveTrimWords.Add(w);
+                i = j - 1;
+                continue;
+            }
             if (a == "--files")
             {
                 int j = i + 1;
@@ -1916,12 +2343,14 @@ class Program
                 i = j - 1;
                 continue;
             }
-            if (a == "asc") { options.Sort = SortDirection.Asc; continue; }
-            if (a == "desc" || a == "rev") { options.Sort = SortDirection.Desc; continue; }
-            if (a == "sort:count") { options.SortBy = SortBy.Count; continue; }
-            if (a == "sort:ppm") { options.SortBy = SortBy.Ppm; continue; }
-            if (a.StartsWith("top:")) { 
-                string value = a.Substring(4);
+            if (a == "--sort" && i + 1 < args.Length) {
+                i++;
+                if (args[i] == "count") options.SortBy = SortBy.Count;
+                else if (args[i] == "ppm") options.SortBy = SortBy.Ppm;
+                continue;
+            }
+            if (a == "--top" && i + 1 < args.Length) {
+                i++; string value = args[i];
                 // Check if it's a percentage
                 if (value.EndsWith("%")) {
                     string percentStr = value.Substring(0, value.Length - 1);
@@ -1939,8 +2368,8 @@ class Program
                 }
                 continue; 
             }
-            if (a.StartsWith("bottom:")) { 
-                string value = a.Substring(7);
+            if (a == "--bottom" && i + 1 < args.Length) {
+                i++; string value = args[i];
                 // Check if it's a percentage
                 if (value.EndsWith("%")) {
                     string percentStr = value.Substring(0, value.Length - 1);
@@ -1975,45 +2404,86 @@ class Program
             // exclude file
             if (a == "--exclude-file" && i + 1 < args.Length) { i++; options.ExcludeFiles.Add(args[i]); continue; }
             // explicit, unambiguous filter flags (preferred when combining with --files)
-            if (a == "--contains" && i + 1 < args.Length) {
+            // --phrase-contains / --remove-phrase-contains are explicit, self-documenting
+            // aliases for --contains / --remove-contains: both filter the assembled n-gram
+            // PHRASE text (post-tokenization, post-count) — never the raw source line. See
+            // --line-contains above for the genuinely different, line-level filter stage.
+            if ((a == "--contains" || a == "--phrase-contains") && i + 1 < args.Length) {
                 i++; var p = args[i];
                 var f = new TextFilter { Type = TextFilter.TypeEnum.Contains, Pattern = p };
-                if (TryCompileRegex(p.ToLower(), out Regex rgx)) f.CompiledRegex = rgx;
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
                 options.TextFilters.Add(f); continue;
             }
-            if (a == "--remove-contains" && i + 1 < args.Length) {
+            if ((a == "--remove-contains" || a == "--remove-phrase-contains") && i + 1 < args.Length) {
                 i++; var p = args[i];
                 var f = new TextFilter { Type = TextFilter.TypeEnum.NotContains, Pattern = p };
-                if (TryCompileRegex(p.ToLower(), out Regex rgx)) f.CompiledRegex = rgx;
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
                 options.TextFilters.Add(f); continue;
+            }
+            // --line-contains / --remove-line-contains: a genuinely SEPARATE pipeline
+            // stage from --contains/--remove-contains above — these filter whole SOURCE
+            // LINES before tokenization (deciding what enters the n-gram pool at all),
+            // not already-built n-gram phrase results after the fact. See PassLineFilters.
+            if (a == "--line-contains" && i + 1 < args.Length) {
+                i++; var p = args[i];
+                var f = new TextFilter { Type = TextFilter.TypeEnum.Contains, Pattern = p };
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
+                options.LineFilters.Add(f); continue;
+            }
+            if (a == "--remove-line-contains" && i + 1 < args.Length) {
+                i++; var p = args[i];
+                var f = new TextFilter { Type = TextFilter.TypeEnum.NotContains, Pattern = p };
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
+                options.LineFilters.Add(f); continue;
             }
             if (a == "--starts" && i + 1 < args.Length) {
                 i++; var p = args[i];
                 var f = new TextFilter { Type = TextFilter.TypeEnum.StartsWith, Pattern = p };
-                if (TryCompileRegex(p.ToLower(), out Regex rgx)) f.CompiledRegex = rgx;
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
                 options.TextFilters.Add(f); continue;
             }
             if (a == "--remove-starts" && i + 1 < args.Length) {
                 i++; var p = args[i];
                 var f = new TextFilter { Type = TextFilter.TypeEnum.NotStartsWith, Pattern = p };
-                if (TryCompileRegex(p.ToLower(), out Regex rgx)) f.CompiledRegex = rgx;
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
                 options.TextFilters.Add(f); continue;
             }
             if (a == "--ends" && i + 1 < args.Length) {
                 i++; var p = args[i];
                 var f = new TextFilter { Type = TextFilter.TypeEnum.EndsWith, Pattern = p };
-                if (TryCompileRegex(p.ToLower(), out Regex rgx)) f.CompiledRegex = rgx;
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
                 options.TextFilters.Add(f); continue;
             }
             if (a == "--remove-ends" && i + 1 < args.Length) {
                 i++; var p = args[i];
                 var f = new TextFilter { Type = TextFilter.TypeEnum.NotEndsWith, Pattern = p };
-                if (TryCompileRegex(p.ToLower(), out Regex rgx)) f.CompiledRegex = rgx;
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
                 options.TextFilters.Add(f); continue;
             }
             // max-items cap (default 200; 0 = unlimited); only applies when user gave no explicit top:/bottom:
             if (a == "--max-items" && i + 1 < args.Length) {
                 i++; if (int.TryParse(args[i], out int mi)) { options.MaxItems = mi; options.MaxItemsSetExplicitly = true; }
+                continue;
+            }
+            // --max-items-per-file N (default 15; 0 = unlimited) — caps rows per-file within
+            // `--show-tfidf --per-file` tables, independent of the global --max-items above
+            // (see ngc-feedback.md #3).
+            if (a == "--max-items-per-file" && i + 1 < args.Length) {
+                i++; if (int.TryParse(args[i], out int mipf)) { options.MaxItemsPerFile = mipf; }
+                continue;
+            }
+            // --top-files N (0 = unlimited): caps how many --files documents get a full
+            // breakdown table under `--show-tfidf --per-file`, after ranking documents by
+            // an aggregate per-file distinctiveness score (see TopFilesBy / PrintTfidf).
+            if (a == "--top-files" && i + 1 < args.Length) {
+                i++; if (int.TryParse(args[i], out int tf)) { options.TopFiles = tf == 0 ? int.MaxValue : tf; }
+                continue;
+            }
+            // --top-files-by max|sum|avg-top5 — which aggregate to rank files by (see
+            // CommandOptions.TopFilesBy doc comment for what each one rewards/penalizes).
+            if (a == "--top-files-by" && i + 1 < args.Length) {
+                i++; var mode = args[i];
+                if (mode == "max" || mode == "sum" || mode == "avg-top5") options.TopFilesBy = mode;
                 continue;
             }
             // NOTE: bare/implicit content-filter syntax ("pattern", -"pattern", "pattern..",
@@ -2022,100 +2492,100 @@ class Program
             // --remove-starts, --ends, --remove-ends. This closes the "silent absorption" bug
             // where any unrecognized/mistyped token (a flag typo, a stray word, etc.) used to
             // fall through and become a no-op Contains filter instead of an error.
-            // frequency patterns with prefix
-            if (a.StartsWith("freq:"))
+            //
+            // NOTE 2: bare colon-form ("freq:10+", "top:50", "cdf:5", etc.) has been removed
+            // entirely too (ngc-feedback.md #2) — every value flag below now REQUIRES the
+            // explicit "--flag VALUE" form, one consistent grammar, no guessing whether an
+            // unprefixed token is a positional argument, a filter, or a typo'd flag.
+            if (a == "--freq" && i + 1 < args.Length)
             {
-                var freqExpr = a.Substring(5);
+                i++; var freqExpr = args[i];
                 if (Regex.IsMatch(freqExpr, @"^\d+$")) { int exactFreq = int.Parse(freqExpr); options.FrequencyFilters.Add(new FrequencyFilter { Min = exactFreq, Max = exactFreq, Outside = false }); continue; }
                 if (Regex.IsMatch(freqExpr, @"^\d+\.\.\d+$")) { var pp = freqExpr.Split(new[] { ".." }, StringSplitOptions.None); options.FrequencyFilters.Add(new FrequencyFilter { Min = int.Parse(pp[0]), Max = int.Parse(pp[1]), Outside = false }); continue; }
                 if (Regex.IsMatch(freqExpr, @"^\d+\+$")) { options.FrequencyFilters.Add(new FrequencyFilter { Min = int.Parse(freqExpr.TrimEnd('+')), Max = null, Outside = false }); continue; }
                 if (Regex.IsMatch(freqExpr, @"^\.\.\d+$")) { options.FrequencyFilters.Add(new FrequencyFilter { Min = null, Max = int.Parse(freqExpr.Substring(2)), Outside = false }); continue; }
                 if (Regex.IsMatch(freqExpr, @"^!\d+\+$")) { options.FrequencyFilters.Add(new FrequencyFilter { Min = null, Max = int.Parse(freqExpr.Substring(1).TrimEnd('+')) - 1, Outside = false }); continue; }
                 if (Regex.IsMatch(freqExpr, @"^!\d+\.\.\d+$")) { var pp = freqExpr.Substring(1).Split(new[] { ".." }, StringSplitOptions.None); options.FrequencyFilters.Add(new FrequencyFilter { Min = int.Parse(pp[0]), Max = int.Parse(pp[1]), Outside = true }); continue; }
+                continue;
             }
-            
-            // legacy frequency patterns (keep for backward compatibility)
-            if (Regex.IsMatch(a, @"^\d+$") && !a.StartsWith("-") && !options.NGramSizes.Contains(int.Parse(a))) { int exactFreq = int.Parse(a); options.FrequencyFilters.Add(new FrequencyFilter { Min = exactFreq, Max = exactFreq, Outside = false }); continue; }
-            if (Regex.IsMatch(a, @"^\d+\.\.\d+$")) { var pp = a.Split(new[] { ".." }, StringSplitOptions.None); options.FrequencyFilters.Add(new FrequencyFilter { Min = int.Parse(pp[0]), Max = int.Parse(pp[1]), Outside = false }); continue; }
-            if (Regex.IsMatch(a, @"^\d+\+$")) { options.FrequencyFilters.Add(new FrequencyFilter { Min = int.Parse(a.TrimEnd('+')), Max = null, Outside = false }); continue; }
-            if (Regex.IsMatch(a, @"^\.\.\d+$")) { options.FrequencyFilters.Add(new FrequencyFilter { Min = null, Max = int.Parse(a.Substring(2)), Outside = false }); continue; }
-            if (Regex.IsMatch(a, @"^!\d+\+$")) { options.FrequencyFilters.Add(new FrequencyFilter { Min = null, Max = int.Parse(a.Substring(1).TrimEnd('+')) - 1, Outside = false }); continue; }
-            if (Regex.IsMatch(a, @"^!\d+\.\.\d+$")) { var pp = a.Substring(1).Split(new[] { ".." }, StringSplitOptions.None); options.FrequencyFilters.Add(new FrequencyFilter { Min = int.Parse(pp[0]), Max = int.Parse(pp[1]), Outside = true }); continue; }
-            // ppm patterns
-            if (a.StartsWith("ppm:"))
+            if (a == "--ppm" && i + 1 < args.Length)
             {
-                var p = a.Substring(4);
+                i++; var p = args[i];
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?$") && !p.EndsWith("+")) { double exactPpm = double.Parse(p); options.PpmFilters.Add(new PpmFilter { Min = exactPpm, Max = exactPpm, Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\d+\.\.\d+$")) { var pp = p.Split(new[] { ".." }, StringSplitOptions.None); options.PpmFilters.Add(new PpmFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\d+\+$")) { options.PpmFilters.Add(new PpmFilter { Min = double.Parse(p.TrimEnd('+')), Max = null, Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\.\.\d+$")) { options.PpmFilters.Add(new PpmFilter { Min = null, Max = double.Parse(p.Substring(2)), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^!\d+\+$")) { options.PpmFilters.Add(new PpmFilter { Min = null, Max = double.Parse(p.Substring(1).TrimEnd('+')), Outside = true }); continue; }
                 if (Regex.IsMatch(p, @"^!\d+\.\.\d+$")) { var pp = p.Substring(1).Split(new[] { ".." }, StringSplitOptions.None); options.PpmFilters.Add(new PpmFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = true }); continue; }
+                continue;
             }
-            // z patterns
-            if (a.StartsWith("z:"))
+            if (a == "--z" && i + 1 < args.Length)
             {
-                var p = a.Substring(2);
+                i++; var p = args[i];
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?\.\.\d+(\.\d+)?$")) { var pp = p.Split(new[] { ".." }, StringSplitOptions.None); options.ZFilters.Add(new ZFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?$")) { options.ZFilters.Add(new ZFilter { Min = -double.Parse(p), Max = double.Parse(p), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^!\d+(\.\d+)?$")) { options.ZFilters.Add(new ZFilter { Min = double.Parse(p.Substring(1)), Max = null, Outside = true }); continue; }
+                continue;
             }
-            // pmi patterns (log2 observed/expected; can be negative, so allow leading '-')
-            if (a.StartsWith("pmi:"))
+            if (a == "--pmi" && i + 1 < args.Length)
             {
-                var p = a.Substring(4);
+                i++; var p = args[i];
                 if (Regex.IsMatch(p, @"^-?\d+(\.\d+)?\.\.-?\d+(\.\d+)?$")) { var pp = p.Split(new[] { ".." }, StringSplitOptions.None); options.PmiFilters.Add(new PmiFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^-?\d+(\.\d+)?\+$")) { options.PmiFilters.Add(new PmiFilter { Min = double.Parse(p.TrimEnd('+')), Max = null, Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^!-?\d+(\.\d+)?\+$")) { options.PmiFilters.Add(new PmiFilter { Min = null, Max = double.Parse(p.Substring(1).TrimEnd('+')), Outside = true }); continue; }
                 if (Regex.IsMatch(p, @"^!-?\d+(\.\d+)?$")) { options.PmiFilters.Add(new PmiFilter { Min = null, Max = double.Parse(p.Substring(1)), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^-?\d+(\.\d+)?$")) { double exactPmi = double.Parse(p); options.PmiFilters.Add(new PmiFilter { Min = exactPmi, Max = exactPmi, Outside = false }); continue; }
+                continue;
             }
-            // tfidf patterns (always >= 0 in practice, but allow same shape as pmi minus negative)
-            if (a.StartsWith("tfidf:"))
+            if (a == "--tfidf" && i + 1 < args.Length)
             {
-                var p = a.Substring(6);
+                i++; var p = args[i];
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?\.\.\d+(\.\d+)?$")) { var pp = p.Split(new[] { ".." }, StringSplitOptions.None); options.TfidfFilters.Add(new TfidfFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?\+$")) { options.TfidfFilters.Add(new TfidfFilter { Min = double.Parse(p.TrimEnd('+')), Max = null, Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\.\.\d+(\.\d+)?$")) { options.TfidfFilters.Add(new TfidfFilter { Min = null, Max = double.Parse(p.Substring(2)), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^!\d+(\.\d+)?\+$")) { options.TfidfFilters.Add(new TfidfFilter { Min = null, Max = double.Parse(p.Substring(1).TrimEnd('+')), Outside = true }); continue; }
                 if (Regex.IsMatch(p, @"^!\d+(\.\d+)?\.\.\d+(\.\d+)?$")) { var pp = p.Substring(1).Split(new[] { ".." }, StringSplitOptions.None); options.TfidfFilters.Add(new TfidfFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = true }); continue; }
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?$")) { double exactTfidf = double.Parse(p); options.TfidfFilters.Add(new TfidfFilter { Min = exactTfidf, Max = exactTfidf, Outside = false }); continue; }
-            }            // cdf patterns (formerly "percentile:")
-            if (a.StartsWith("cdf:"))
+                continue;
+            }
+            if (a == "--cdf" && i + 1 < args.Length)
             {
-                var p = a.Substring(4);
+                i++; var p = args[i];
                 // Handle shorthand notation (with or without % sign)
-                if (Regex.IsMatch(p, @"^\d+(\.\d+)?%?$") && !p.Contains("..") && !p.EndsWith("+")) 
-                { 
+                if (Regex.IsMatch(p, @"^\d+(\.\d+)?%?$") && !p.Contains("..") && !p.EndsWith("+"))
+                {
                     // Remove % sign if present
                     string valueStr = p.EndsWith("%") ? p.Substring(0, p.Length - 1) : p;
                     double percentage = double.Parse(valueStr);
-                    
+
                     // Calculate min and max percentiles for the central range to exclude
                     double lowerBound = percentage;
                     double upperBound = 100 - percentage;
-                    
-                    options.PercentileFilters.Add(new PercentileFilter { 
-                        Min = lowerBound, 
-                        Max = upperBound, 
+
+                    options.PercentileFilters.Add(new PercentileFilter {
+                        Min = lowerBound,
+                        Max = upperBound,
                         Outside = true  // We want items OUTSIDE this range
-                    }); 
-                    continue; 
+                    });
+                    continue;
                 }
-                
+
                 // Standard percentile range patterns
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?\.\.\d+(\.\d+)?$")) { var pp = p.Split(new[] { ".." }, StringSplitOptions.None); options.PercentileFilters.Add(new PercentileFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\d+(\.\d+)?\+$")) { options.PercentileFilters.Add(new PercentileFilter { Min = double.Parse(p.TrimEnd('+')), Max = null, Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^\.\.\d+(\.\d+)?$")) { options.PercentileFilters.Add(new PercentileFilter { Min = null, Max = double.Parse(p.Substring(2)), Outside = false }); continue; }
                 if (Regex.IsMatch(p, @"^!\d+(\.\d+)?\+$")) { options.PercentileFilters.Add(new PercentileFilter { Min = null, Max = double.Parse(p.Substring(1).TrimEnd('+')), Outside = true }); continue; }
                 if (Regex.IsMatch(p, @"^!\d+(\.\d+)?\.\.\d+(\.\d+)?$")) { var pp = p.Substring(1).Split(new[] { ".." }, StringSplitOptions.None); options.PercentileFilters.Add(new PercentileFilter { Min = double.Parse(pp[0]), Max = double.Parse(pp[1]), Outside = true }); continue; }
+                continue;
             }
             // Any token that reaches here didn't match a known flag/filter/n-gram-size/preset —
             // it is NOT silently absorbed as a content filter anymore. Error out loudly instead,
             // so typos (like "--by-file" instead of "--per-file") or stray words fail immediately
             // rather than quietly becoming a no-op filter that matches nothing.
             Console.Error.WriteLine($"Unrecognized argument: {a}");
-            Console.Error.WriteLine("Content filters now require an explicit flag: --contains, --remove-contains, --starts, --remove-starts, --ends, or --remove-ends.");
+            Console.Error.WriteLine("Every ngc argument must start with \"--\" (e.g. --top 50, --freq 10+, --cdf 5).");
+            Console.Error.WriteLine("Bare/colon-form tokens (\"top:50\", \"freq:10+\", \"rev\", \"+++\") are no longer supported.");
+            Console.Error.WriteLine("Content filters require an explicit flag: --contains, --remove-contains, --starts, --remove-starts, --ends, or --remove-ends.");
             Console.Error.WriteLine("Run with --help to see available options.");
             Environment.Exit(1);
         }
