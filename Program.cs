@@ -106,6 +106,10 @@ class CommandOptions
     // Separate namespace/report: n-grams built from the interior segments of path-like
     // units (e.g. "src/whatever" from "src/whatever/services"), distinct from prose n-grams.
     public bool ShowPathNGrams = false;
+    // Tracking flags (not user-facing) for the "--show-cdf/--show-pdf implies --hide-phrases
+    // unless something says otherwise" rule below in ParseArgs' post-processing step.
+    public bool ShowPhrasesExplicit = false; // true iff --show-phrases or --hide-phrases was passed literally
+    public bool MorePresetUsed = false;      // true iff --more/--more++/--more+++ was passed
     // Stopword filtering: on by default. An n-gram is dropped only if EVERY word in it is a
     // stopword (mixed phrases like "the guard" are kept). Starting basis is either
     // StopWords.Default or empty, decided by a pre-scan for --no-stop-words (see ParseArgs);
@@ -629,15 +633,27 @@ class Program
             if (options.ShowMerged)
             {
                 var mergedList = SortAndLimit(merged, options).ToList();
-                var cappedMergedMinimal = ApplyMaxItemsCap(mergedList, options, options.Sort == SortDirection.Asc ? "ascending" : "descending", out var mergedMinimalNotice);
-                foreach (var it in cappedMergedMinimal) PrintEntry(it, options, "merged");
-                if (mergedMinimalNotice != null) Console.WriteLine(mergedMinimalNotice);
+                if (mergedList.Count == 0)
+                {
+                    PrintNoMatchesNotice();
+                }
+                else
+                {
+                    var cappedMergedMinimal = ApplyMaxItemsCap(mergedList, options, options.Sort == SortDirection.Asc ? "ascending" : "descending", out var mergedMinimalNotice);
+                    foreach (var it in cappedMergedMinimal) PrintEntry(it, options, "merged");
+                    if (mergedMinimalNotice != null) Console.WriteLine(mergedMinimalNotice);
+                }
             }
             else
             {
                 foreach (var n in options.NGramSizes.OrderBy(x => x))
                 {
                     var list = SortAndLimit(outputs[n], options).ToList();
+                    if (list.Count == 0)
+                    {
+                        PrintNoMatchesNotice();
+                        continue;
+                    }
                     var cappedList = ApplyMaxItemsCap(list, options, options.Sort == SortDirection.Asc ? "ascending" : "descending", out var minimalNotice);
                     foreach (var it in cappedList) PrintEntry(it, options, n.ToString());
                     if (minimalNotice != null) Console.WriteLine(minimalNotice);
@@ -667,6 +683,12 @@ class Program
                 // Apply percentile/top/bottom limits and materialize final list for this n
                 var finalList = SortAndLimit(outputs[n], options).ToList();
                 var postFilterCount = finalList.Count;
+
+                if (postFilterCount == 0)
+                {
+                    PrintNoMatchesNotice();
+                    continue;
+                }
                 
                 // Calculate percentage of n-grams that passed the filters (relative to pre-filter unique count)
                 double percentRetained = preStats.uniqueCount > 0 
@@ -789,6 +811,13 @@ class Program
             // Apply percentile/top/bottom limits to merged results and materialize final list
             var finalMerged = SortAndLimit(merged, options).ToList();
 
+            if (finalMerged.Count == 0)
+            {
+                PrintNoMatchesNotice();
+            }
+            else
+            {
+
             // Calculate statistics for merged results based on final (post-filter) set
             var mergedFrequencies = finalMerged.Select(x => x.count).ToArray();
             Array.Sort(mergedFrequencies);
@@ -885,6 +914,7 @@ class Program
                 }
                 if (mergedMaxItemsNotice != null) Console.WriteLine(mergedMaxItemsNotice);
             }
+            } // end else (finalMerged.Count != 0)
         }
 
         if (options.ShowTfidf)
@@ -1105,7 +1135,47 @@ class Program
                 if (topFilesCapped)
                     Console.WriteLine($"[showing top {options.TopFiles} of {rankedDocs.Count} files, ranked by {options.TopFilesBy} TF-IDF score — use `--top-files 0` for all]");
             }
+
+            // Feedback item #3 (CDRs/ngc-feedback.md Round 3, decision #3): cheap dispersion
+            // hint reusing the DF (document frequency) data already computed above for TF-IDF.
+            // Terms present in near-every document are likely shared structural/template
+            // vocabulary (e.g. repeated section headings), not real content — flag them so the
+            // user can suppress them and re-rank, rather than silently letting them dominate
+            // every file's "top terms" list. This is a crude DF-ratio proxy, not a true
+            // dispersion measure (Juilland's D/DP, see cdrs/ideas/idea-007) — a term appearing
+            // once in 90% of docs looks identical here to one appearing 50x in one doc and 1x
+            // in nine others. Deliberately simple for now; upgrade later if idea-007 lands.
+            PrintDispersionHint(rows, docCount, options);
         }
+    }
+
+    const double NearUniversalDispersionThreshold = 0.9; // DF/docCount >= this => "near-universal"
+    const int NearUniversalDispersionHintSampleSize = 10; // cap how many example terms we print
+
+    static void PrintDispersionHint(
+        List<(string ngram, int count, int docFreq, double idf, double tfidfMax, string bestFile)> rows,
+        int docCount,
+        CommandOptions options)
+    {
+        if (docCount < 3) return; // dispersion is a meaningless signal with only 1-2 documents
+
+        var nearUniversal = rows
+            .Where(r => (double)r.docFreq / docCount >= NearUniversalDispersionThreshold)
+            .OrderByDescending(r => r.docFreq)
+            .ThenByDescending(r => r.count)
+            .ToList();
+
+        if (nearUniversal.Count == 0) return;
+
+        var sample = nearUniversal.Take(NearUniversalDispersionHintSampleSize).Select(r => r.ngram).ToList();
+        string moreSuffix = nearUniversal.Count > sample.Count ? $", +{nearUniversal.Count - sample.Count} more" : "";
+
+        Console.WriteLine($"⚠ {nearUniversal.Count} term(s) appear in ≥{NearUniversalDispersionThreshold * 100:F0}% of your {docCount} documents");
+        Console.WriteLine("  (near-universal dispersion) — likely shared structural/template vocabulary");
+        Console.WriteLine("  (e.g. repeated section headings), not distinctive content. This is a crude");
+        Console.WriteLine("  DF-ratio proxy, not a true dispersion measure — treat as a hint, not a fact.");
+        Console.WriteLine($"  Consider suppressing before re-ranking: --stop-words {string.Join(" ", sample)}{moreSuffix}");
+        Console.WriteLine();
     }
 
     static bool HasExplicitLimit(CommandOptions options) => options.Limit < int.MaxValue || options.LimitIsPercentage || options.BottomLimit > 0 || options.BottomLimitIsPercentage;
@@ -1798,6 +1868,15 @@ class Program
         return ok;
     }
 
+    // Feedback item #2 (CDRs/ngc-feedback.md Round 3): a legitimately empty, filtered-down-to-
+    // zero result set currently looks identical (an all-zero stats header) to a query that
+    // silently no-op'd due to a bad regex/anchor. Print a visibly distinct notice so users can
+    // trust a real zero-match result instead of re-checking their filters every time.
+    static void PrintNoMatchesNotice()
+    {
+        Console.WriteLine("⚠ No matches found for these filters.");
+    }
+
     static CommandOptions ParseArgs(string[] args)
     {
         var options = new CommandOptions();
@@ -2298,6 +2377,7 @@ class Program
                 options.ShowPpm = true;
                 options.ShowPpmStats = true;
                 options.ShowColumnHeader = true;
+                options.MorePresetUsed = true;
                 continue;
             }
             if (a == "--more++") {
@@ -2307,6 +2387,7 @@ class Program
                 options.ShowPpm = true;
                 options.ShowPpmStats = true;
                 options.ShowColumnHeader = true;
+                options.MorePresetUsed = true;
                 continue;
             }
             if (a == "--more+++") {
@@ -2317,6 +2398,7 @@ class Program
                 options.ShowPpmStats = true;
                 options.ShowColumnHeader = true;
                 options.ShowZ = true;
+                options.MorePresetUsed = true;
                 continue;
             }
             if (a == "--show-input") { options.ShowInput = true; continue; }
@@ -2331,8 +2413,8 @@ class Program
             if (a == "--hide-ppm-stats") { options.ShowPpmStats = false; continue; }
             if (a == "--show-column-header") { options.ShowColumnHeader = true; continue; }
             if (a == "--hide-column-header") { options.ShowColumnHeader = false; continue; }
-            if (a == "--show-phrases") { options.ShowPhrases = true; continue; }
-            if (a == "--hide-phrases") { options.ShowPhrases = false; continue; }
+            if (a == "--show-phrases") { options.ShowPhrases = true; options.ShowPhrasesExplicit = true; continue; }
+            if (a == "--hide-phrases") { options.ShowPhrases = false; options.ShowPhrasesExplicit = true; continue; }
             if (a == "--show-tfidf-phrases") { options.ShowTfidfPhrases = true; continue; }
             if (a == "--hide-tfidf-phrases") { options.ShowTfidfPhrases = false; continue; }
             if (a == "--show-merged") { options.ShowMerged = true; continue; }
@@ -2722,6 +2804,19 @@ class Program
             Console.Error.WriteLine("Run with --help to see available options.");
             Environment.Exit(1);
         }
+
+        // Rule (agreed in CDRs/ngc-feedback.md Round 3, decision #1): if the user asked for
+        // a summary-only report (--show-cdf and/or --show-pdf) and did NOT explicitly say
+        // --show-phrases/--hide-phrases, and hasn't opted into the "show everything" ladder
+        // via --more++/--more+++, then suppress the phrase-list body by default — a bare
+        // `ngc 1 --show-cdf` should print just the ladder, not also a huge raw phrase dump.
+        // Explicit --show-phrases always wins (handled above by ShowPhrasesExplicit), and
+        // --more+++'s existing "show everything" behavior is untouched (MorePresetUsed gate).
+        if ((options.ShowCdf || options.ShowPdf) && !options.ShowPhrasesExplicit && !options.MorePresetUsed)
+        {
+            options.ShowPhrases = false;
+        }
+
         return options;
     }
 }
