@@ -119,6 +119,29 @@ class CommandOptions
     // StopWords). Same --no-trim-words / --trim-words additive semantics as stopwords above.
     public HashSet<string> EffectiveTrimWords = new HashSet<string>(TrimWords.Default, StringComparer.OrdinalIgnoreCase);
     public bool PerFile = false;
+
+    // --- Tokenizer Layers 1-3 (ngc-feedback.md #4 generalization) ---
+    // Layer 1: pair-span detection. Default pairs: double-quote, single-quote (apostrophe-
+    // adjacency-aware, see Tokenizer.BuildPairRegex), and backtick (markdown code-spans —
+    // new default, closes the "`RemoteApi`'s" stray-'s edge case from ngc-feedback.md #4).
+    // --pair-chars adds more (open,close) pairs on top of this basis; --no-pair-chars resets
+    // the basis to empty first (same order-independent pre-scan pattern as --no-stop-words).
+    public List<(char open, char close)> EffectivePairChars = new List<(char open, char close)>
+    {
+        ('"', '"'), ('\'', '\''), ('`', '`'),
+    };
+    // Layer 2: keep-symbols. A character glues to its word if it's a letter/digit or in this
+    // set; everything else is a hard split boundary. Default: hyphen (compounds like
+    // "re-run") + apostrophe (possessives/contractions like "Android's", "don't" — the
+    // ngc-feedback.md #4 fix). --keep-symbols adds more; --no-keep-symbols resets to empty.
+    public HashSet<char> EffectiveKeepSymbols = new HashSet<char> { '-', '\'' };
+    // Layer 3: trim-symbols. Strip leading/trailing characters in this set from each already-
+    // formed plain word (edge-only). Empty by default — Layer 2 already can't leave a
+    // non-keep character stuck to a word's edge, so this only starts doing real work once a
+    // user opts extra punctuation into Layer 2's keep-set via --keep-symbols and wants it
+    // excluded from just the edges. --trim-symbols adds; --no-trim-symbols resets (also a
+    // no-op against the already-empty default, kept for symmetry/discoverability).
+    public HashSet<char> EffectiveTrimSymbols = new HashSet<char>();
     // --files glob1 [glob2 ...] — when non-empty, read these files/globs as
     // separate documents instead of reading stdin as one blob. Relative globs
     // (including "../" parent-traversal, e.g. "../other-repo/**/*.cs") are
@@ -173,8 +196,14 @@ class Program
     private static bool TryCompileRegex(string pattern, out Regex regex, bool ignoreCase = false)
     {
         regex = null!;
-        // Check for common regex metacharacters
-        if (pattern.IndexOfAny(new[] { '|', '*', '+', '?', '[', ']', '(', ')', '{', '}', '\\' }) < 0)
+        // Check for common regex metacharacters. `^`/`$` (anchors) are included even though
+        // they're single-purpose regex-only chars with no literal-substring meaning here —
+        // omitting them was a real bug (ngc-feedback.md): a pattern like "^payload" has none
+        // of the OTHER metachars below, so it used to be (wrongly) treated as a literal
+        // substring search for the 8-character string "^payload" (caret included), which of
+        // course never appears anywhere, silently producing a confident "0 results" instead
+        // of the anchored match the user asked for.
+        if (pattern.IndexOfAny(new[] { '|', '*', '+', '?', '[', ']', '(', ')', '{', '}', '\\', '^', '$' }) < 0)
             return false; // Not a regex pattern
             
         try
@@ -310,9 +339,11 @@ class Program
                 if (string.IsNullOrWhiteSpace(line)) continue;
                 if (!PassLineFilters(line, options.LineFilters, options.IgnoreCase)) continue;
 
-                // Layer 1+2: detect atomic units (paths, quoted spans) first, then split
-                // the remaining plain text into words using the existing alnum+hyphen rule.
-                var tokens = Tokenizer.Tokenize(line);
+                // Layer 1+2+3: detect atomic units (paths, quoted/backtick/user-defined
+                // paired spans) first, then split the remaining plain text into words using
+                // the configurable keep-symbols rule, then trim configurable edge characters
+                // off each resulting word. See ngc-feedback.md #4 for the full design.
+                var tokens = Tokenizer.Tokenize(line, options.EffectivePairChars, options.EffectiveKeepSymbols, options.EffectiveTrimSymbols);
 
                 // Layer 3a: prose n-grams. Each token contributes exactly one slot via
                 // Display — a Unit (e.g. a path) never fragments into multiple slots, so it
@@ -1779,6 +1810,12 @@ class Program
         // always happens before the (order-preserving) additive pass in the main loop.
         if (args.Contains("--no-stop-words")) options.EffectiveStopWords.Clear();
         if (args.Contains("--no-trim-words")) options.EffectiveTrimWords.Clear();
+        // Same order-independent reset pattern for the three new tokenizer-layer sets
+        // (ngc-feedback.md #4): a --no-X anywhere on the command line clears the default
+        // basis to empty BEFORE any --X additions (parsed in the main loop below) are added.
+        if (args.Contains("--no-pair-chars")) options.EffectivePairChars.Clear();
+        if (args.Contains("--no-keep-symbols")) options.EffectiveKeepSymbols.Clear();
+        if (args.Contains("--no-trim-symbols")) options.EffectiveTrimSymbols.Clear();
         // --ignore-case must be known before any --contains/--starts/--ends/etc. are parsed
         // below, since it's baked into the compiled Regex at parse time (RegexOptions.IgnoreCase)
         // — same order-independence concern as the two lines above.
@@ -1943,6 +1980,43 @@ class Program
             Console.WriteLine("    --trim-words foo bar         # ADD words to the CURRENT set, same semantics");
             Console.WriteLine("                                 # as --stop-words above");
             Console.WriteLine("    (--trim is a short alias for --trim-words)");
+
+            Console.WriteLine("\nTOKENIZER LAYERS — three lower-level, independently controllable stages that");
+            Console.WriteLine("run BEFORE stopwords/trim-words above, turning raw text into words/phrases at");
+            Console.WriteLine("all (see ngc-feedback.md #4 for the full design rationale):");
+            Console.WriteLine("");
+            Console.WriteLine("  Layer 1 — PAIR-CHARS: protected atomic spans, immune to all later splitting.");
+            Console.WriteLine("  Defaults: \"..\" (double-quote), ''..'' (single-quote/apostrophe-aware — see");
+            Console.WriteLine("  APOSTROPHE NOTE above), and `..` (backtick code-spans — protects `RemoteApi`");
+            Console.WriteLine("  as one atomic display token, so a following possessive like `RemoteApi`'s");
+            Console.WriteLine("  doesn't leave a stray orphaned \"'s\" token with nothing left to glue to).");
+            Console.WriteLine("  Path-shape detection (\"word/word/word\") stays a separate, shape-based");
+            Console.WriteLine("  detector, not a pair-chars entry — it isn't a delimiter pair, it's a shape.");
+            Console.WriteLine("    --no-pair-chars          # Reset to EMPTY (disables ALL pair-protection,");
+            Console.WriteLine("                             # including the 3 defaults above)");
+            Console.WriteLine("    --pair-chars \"=;\" \"()\"   # ADD open/close delimiter pairs on top of the");
+            Console.WriteLine("                             # current basis — e.g. \"=;\" protects everything");
+            Console.WriteLine("                             # from = to the next ; as one atomic span");
+            Console.WriteLine("                             # (config-value-style spans); each pair must be");
+            Console.WriteLine("                             # exactly 2 characters (open then close; open ==");
+            Console.WriteLine("                             # close is fine, e.g. \"==\")");
+            Console.WriteLine("");
+            Console.WriteLine("  Layer 2 — KEEP-SYMBOLS: characters that glue to their word instead of hard-");
+            Console.WriteLine("  splitting it. Defaults: '-' (hyphenated compounds: \"re-run\", \"multi-device\")");
+            Console.WriteLine("  and ''' (possessives/contractions: \"Android's\", \"don't\", \"isn't\").");
+            Console.WriteLine("    --no-keep-symbols        # Reset to EMPTY (every non-alnum char splits)");
+            Console.WriteLine("    --keep-symbols \"._\"      # ADD characters (each char in each arg is added");
+            Console.WriteLine("                             # individually) to the CURRENT glue-set");
+            Console.WriteLine("");
+            Console.WriteLine("  Layer 3 — TRIM-SYMBOLS: strip leading/trailing characters from each already-");
+            Console.WriteLine("  formed word (edge-only, never mid-token). EMPTY by default — Layer 2 already");
+            Console.WriteLine("  can't leave a non-keep character stuck to a word's edge, so this only matters");
+            Console.WriteLine("  once you opt extra punctuation INTO Layer 2 via --keep-symbols and want it");
+            Console.WriteLine("  excluded from just the edges, e.g. --keep-symbols \".\" --trim-symbols \".\" keeps");
+            Console.WriteLine("  interior dots (\"U.S.\") but still drops a trailing sentence-final dot.");
+            Console.WriteLine("    --no-trim-symbols        # Reset to EMPTY (no-op vs. the already-empty");
+            Console.WriteLine("                             # default; kept for symmetry/discoverability)");
+            Console.WriteLine("    --trim-symbols \".,;\"     # ADD characters to the CURRENT edge-trim set");
             
             Console.WriteLine("\nFREQUENCY FILTERS:");
             Console.WriteLine("  --freq 10+     # Frequency ≥ 10 occurrences");
@@ -2329,6 +2403,65 @@ class Program
                     j++;
                 }
                 foreach (var w in added) options.EffectiveTrimWords.Add(w);
+                i = j - 1;
+                continue;
+            }
+            if (a == "--no-pair-chars")
+            {
+                // Basis reset handled by the pre-scan in ParseArgs; consumed here as a no-op.
+                continue;
+            }
+            if (a == "--pair-chars")
+            {
+                // --pair-chars "=;" "()" ...: ADD extra (open,close) delimiter pairs on top of
+                // whichever basis is currently in effect (defaults, or empty if
+                // --no-pair-chars was also given). Each argument must be exactly 2 characters:
+                // the open delimiter followed by the close delimiter (open == close is fine,
+                // e.g. "==" protects "=...=" spans the same way quotes/backticks do).
+                int j = i + 1;
+                while (j < args.Length && !IsLikelyOptionToken(args[j]))
+                {
+                    var p = args[j];
+                    if (p.Length == 2) options.EffectivePairChars.Add((p[0], p[1]));
+                    else Console.Error.WriteLine($"--pair-chars: ignoring \"{p}\" — each pair must be exactly 2 characters (open then close).");
+                    j++;
+                }
+                i = j - 1;
+                continue;
+            }
+            if (a == "--no-keep-symbols")
+            {
+                continue;
+            }
+            if (a == "--keep-symbols")
+            {
+                // --keep-symbols "._" ...: ADD characters (one per arg, or a run of chars in
+                // one arg — each char in each arg is added individually) to the Layer-2
+                // word-glue set, on top of whichever basis is currently in effect (defaults
+                // {-, '}, or empty if --no-keep-symbols was also given).
+                int j = i + 1;
+                while (j < args.Length && !IsLikelyOptionToken(args[j]))
+                {
+                    foreach (var ch in args[j]) options.EffectiveKeepSymbols.Add(ch);
+                    j++;
+                }
+                i = j - 1;
+                continue;
+            }
+            if (a == "--no-trim-symbols")
+            {
+                continue;
+            }
+            if (a == "--trim-symbols")
+            {
+                // --trim-symbols ".,;" ...: ADD characters to the Layer-3 edge-trim set, on
+                // top of whichever basis is currently in effect (empty by default).
+                int j = i + 1;
+                while (j < args.Length && !IsLikelyOptionToken(args[j]))
+                {
+                    foreach (var ch in args[j]) options.EffectiveTrimSymbols.Add(ch);
+                    j++;
+                }
                 i = j - 1;
                 continue;
             }
