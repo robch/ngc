@@ -1,0 +1,21 @@
+[submodule "externals/spaCy"]
+	path = externals/spaCy
+	url = https://github.com/explosion/spaCy.git
+[submodule "externals/stanza"]
+	path = externals/stanza
+	url = https://github.com/stanfordnlp/stanza.git
+[submodule "externals/nltk"]
+	path = externals/nltk
+	url = https://github.com/nltk/nltk.git
+[submodule "externals/scikit-learn"]
+	path = externals/scikit-learn
+	url = https://github.com/scikit-learn/scikit-learn.git
+[submodule "externals/gensim"]
+	path = externals/gensim
+	url = https://github.com/piskvorky/gensim.git
+[submodule "externals/CoreNLP"]
+	path = externals/CoreNLP
+	url = https://github.com/stanfordnlp/CoreNLP.git
+[submodule "externals/BERTopic"]
+	path = externals/BERTopic
+	url = https://github.com/MaartenGr/BERTopic.git
