@@ -72,6 +72,8 @@ class CommandOptions
     public double BottomLimitPercentage = 0;
     public int MaxItems = 200;
     public bool MaxItemsSetExplicitly = false;
+    public bool TopFilesSetExplicitly = false;
+    public bool MaxItemsPerFileSetExplicitly = false;
     public bool MinimalOutput = false;
     public bool StatsOnly = false; // Only show statistics, not full phrase lists
     public List<double> UniquePercentiles = new List<double>();
@@ -159,12 +161,14 @@ class CommandOptions
     // Contains/NotContains matching machinery (see PassTextFilters), just against a
     // different string (the whole line) at a different pipeline stage.
     public List<TextFilter> LineFilters = new List<TextFilter>();
-    // --top-files N (with --top-files 0 meaning unlimited/default) — caps how many of
+    // --top-files N (with --top-files 0 meaning unlimited) — caps how many of
     // the matched --files documents get a full breakdown table under
     // `--show-tfidf --per-file`, after ranking documents by an aggregate per-file
     // distinctiveness score (see TopFilesBy). Mirrors the existing --max-items
     // rank+cap+trailing-notice convention, applied one level up (files, not rows).
-    public int TopFiles = int.MaxValue;
+    // Scales with the --less/--more verbosity ladder (ngc-feedback.md #4):
+    // --less--=5, --less=10, (default)=20, --more=50, --more++=100, --more+++=0.
+    public int TopFiles = 20;
     // How to aggregate a single file's many per-ngram TF-IDF scores into one ranking
     // score for --top-files: "max" (that file's single highest-scoring ngram — cheap,
     // but one outlier term can dominate), "sum" (rewards breadth of distinctiveness),
@@ -176,7 +180,8 @@ class CommandOptions
     // --max-items cap (which, before this flag existed, was the only knob controlling
     // per-file row counts too — see ngc-feedback.md #3). Small default so `--per-file` is
     // usable out of the box across many files without needing to hand-tune the global cap
-    // down first.
+    // down first. Scales with the --less/--more verbosity ladder (ngc-feedback.md #6):
+    // --less--=5, --less=10, (default)=15, --more=30, --more++=60, --more+++=0.
     public int MaxItemsPerFile = 15;
 }
 
@@ -1396,12 +1401,23 @@ class Program
                 
                 itemsToTake = Math.Min(itemsToTake, sortedItems.Count);
                 
+                // Guard against --top 0 (or a 0%/negative computed itemsToTake): treat as
+                // "show nothing" rather than indexing sortedItems[-1], which used to throw
+                // an unhandled ArgumentOutOfRangeException (found probing CDRs/ with
+                // `ngc 1 --top 0`, see ngc-feedback.md). Every other 0-meaning-unlimited
+                // flag in ngc (--max-items, --top-files, etc.) is a DIFFERENT flag/knob;
+                // --top 0 has no documented "unlimited" meaning, so literal "zero items" is
+                // the safe, non-crashing interpretation here.
+                if (itemsToTake <= 0)
+                {
+                    limitedSeq = Enumerable.Empty<(string ngram, int count, double ppm, double z, double pmi)>();
+                }
                 // Include all items tied with the boundary value — but ONLY when sorting by
                 // integer count. PPM is a continuous/floating value and, especially at the
                 // low-frequency (long-tail) end of real text, thousands of distinct n-grams can
                 // share the exact same rounded ppm — tie-expansion there silently blows top:N
                 // out to the entire result set. So for ppm-based limiting, honor N strictly.
-                if (usePpm)
+                else if (usePpm)
                 {
                     limitedSeq = sortedItems.Take(itemsToTake);
                 }
@@ -1448,8 +1464,14 @@ class Program
                 
                 // Same rationale as the top:N branch above: only tie-expand for integer count,
                 // not ppm, to avoid blowing bottom:N out to the whole (mostly-tied) long tail.
+                // Also guards against --bottom 0 the same way --top 0 is guarded above (see
+                // ngc-feedback.md) — "zero items" instead of an out-of-range crash.
                 IEnumerable<(string ngram, int count, double ppm, double z, double pmi)> bottomItems;
-                if (usePpm)
+                if (itemsToTake <= 0)
+                {
+                    bottomItems = Enumerable.Empty<(string ngram, int count, double ppm, double z, double pmi)>();
+                }
+                else if (usePpm)
                 {
                     bottomItems = sortedItems.Take(itemsToTake);
                 }
@@ -1678,6 +1700,11 @@ class Program
     // from PassTextFilters (which filters already-built n-gram PHRASE results after the
     // fact) — see --line-contains/--remove-line-contains in --help. Reuses the same
     // TextFilter.Contains/NotContains matching semantics against the whole line string.
+    // Also supports StartsWith/EndsWith (ngc-feedback.md #1) for --line-starts-with/
+    // --line-ends-with — named sugar over the same "match the whole raw line" mechanism
+    // as --line-contains, for the common "isolate this kind of line" case (e.g. Markdown
+    // ATX headings via --line-starts-with "^#{1,6}\s") without needing to hand-write a
+    // regex anchor onto --line-contains yourself.
     static bool PassLineFilters(string line, List<TextFilter> filters, bool ignoreCase = false)
     {
         if (filters.Count == 0) return true;
@@ -1689,6 +1716,10 @@ class Program
                 bool match = f.CompiledRegex.IsMatch(line);
                 if (f.Type == TextFilter.TypeEnum.Contains && !match) return false;
                 if (f.Type == TextFilter.TypeEnum.NotContains && match) return false;
+                if (f.Type == TextFilter.TypeEnum.StartsWith && !match) return false;
+                if (f.Type == TextFilter.TypeEnum.NotStartsWith && match) return false;
+                if (f.Type == TextFilter.TypeEnum.EndsWith && !match) return false;
+                if (f.Type == TextFilter.TypeEnum.NotEndsWith && match) return false;
                 continue;
             }
             switch (f.Type)
@@ -1698,6 +1729,18 @@ class Program
                     break;
                 case TextFilter.TypeEnum.NotContains:
                     if (line.IndexOf(f.Pattern, cmp) >= 0) return false;
+                    break;
+                case TextFilter.TypeEnum.StartsWith:
+                    if (!line.StartsWith(f.Pattern, cmp)) return false;
+                    break;
+                case TextFilter.TypeEnum.NotStartsWith:
+                    if (line.StartsWith(f.Pattern, cmp)) return false;
+                    break;
+                case TextFilter.TypeEnum.EndsWith:
+                    if (!line.EndsWith(f.Pattern, cmp)) return false;
+                    break;
+                case TextFilter.TypeEnum.NotEndsWith:
+                    if (line.EndsWith(f.Pattern, cmp)) return false;
                     break;
             }
         }
@@ -1899,6 +1942,15 @@ class Program
         // below, since it's baked into the compiled Regex at parse time (RegexOptions.IgnoreCase)
         // — same order-independence concern as the two lines above.
         if (args.Contains("--ignore-case")) options.IgnoreCase = true;
+        // --max-items / --max-items-per-file / --top-files all now scale with the
+        // --less--/--less/(default)/--more/--more++/--more+++ verbosity ladder
+        // (ngc-feedback.md #4 and #6) instead of one flat number. Same
+        // order-independence concern as above: detect explicit use of these three
+        // flags BEFORE the main loop runs, so an explicit value always wins no matter
+        // which side of a preset flag it appears on.
+        if (args.Contains("--max-items")) options.MaxItemsSetExplicitly = true;
+        if (args.Contains("--max-items-per-file")) options.MaxItemsPerFileSetExplicitly = true;
+        if (args.Contains("--top-files")) options.TopFilesSetExplicitly = true;
 
         // Used by --files parsing: decides where the glob list for --files ends,
         // i.e. the next recognized ngc token (n-gram size, filter prefix, keyword,
@@ -2021,6 +2073,16 @@ class Program
             Console.WriteLine("will never match anything; use `--contains \"^Guard$\"` (n=1) instead, or");
             Console.WriteLine("`--line-contains \"## Guard\"` to filter on the literal raw line text.");
             Console.WriteLine();
+            Console.WriteLine("TRICK — finding Markdown HEADINGS specifically (not just any line mentioning");
+            Console.WriteLine("a word): --line-contains is regex and matches the whole RAW line, so you can");
+            Console.WriteLine("anchor it to the ATX heading marker itself, e.g.:");
+            Console.WriteLine("    --line-contains \"^#{1,6}\\s\"              # any heading line, any level");
+            Console.WriteLine("    --line-starts-with \"## Guard\"            # only \"## Guard\" headings specifically");
+            Console.WriteLine("This distinguishes a real `## Guard` SECTION HEADING from ordinary prose that");
+            Console.WriteLine("merely mentions the word \"Guard\" somewhere in a line — something plain");
+            Console.WriteLine("`--contains \"^Guard$\"` (which matches the tokenized PHRASE, not the raw line)");
+            Console.WriteLine("cannot distinguish, since tokenization strips the leading \"#\"s either way.");
+            Console.WriteLine();
             Console.WriteLine("APOSTROPHE NOTE: possessives and contractions stay glued as ONE token —");
             Console.WriteLine("\"Android's\", \"don't\", \"isn't\" tokenize whole, not as \"Android\"+\"s\" or");
             Console.WriteLine("\"don\"+\"t\". Genuine single-quoted spans ('like this') are still detected and");
@@ -2036,6 +2098,10 @@ class Program
             Console.WriteLine("    --remove-ends \"pattern\"     # Exclude phrases ending with \"pattern\"");
             Console.WriteLine("    --line-contains \"pattern\"        # Only tokenize lines containing \"pattern\"");
             Console.WriteLine("    --remove-line-contains \"pattern\" # Skip tokenizing lines containing \"pattern\"");
+            Console.WriteLine("    --line-starts-with \"pattern\"     # Only tokenize lines starting with \"pattern\"");
+            Console.WriteLine("    --remove-line-starts-with \"pattern\" # Skip lines starting with \"pattern\"");
+            Console.WriteLine("    --line-ends-with \"pattern\"       # Only tokenize lines ending with \"pattern\"");
+            Console.WriteLine("    --remove-line-ends-with \"pattern\"   # Skip lines ending with \"pattern\"");
             Console.WriteLine("    --exclude-file file.txt     # Exclude phrases containing any term listed in file");
             Console.WriteLine("    --ignore-case               # Make ALL of the above case-insensitive");
             
@@ -2182,9 +2248,13 @@ class Program
             Console.WriteLine("  --top-files N       # With --per-file: only show breakdown tables for the N");
             Console.WriteLine("                      # most distinctive files (ranked by an aggregate TF-IDF");
             Console.WriteLine("                      # score — see --top-files-by), not all matched files.");
-            Console.WriteLine("                      # --top-files 0 = unlimited (default: show all files).");
-            Console.WriteLine("                      # Mirrors --max-items's rank+cap+trailing-notice pattern,");
-            Console.WriteLine("                      # one level up (files, not phrase-rows).");
+            Console.WriteLine("                      # --top-files 0 = unlimited. Default is 20, and — like");
+            Console.WriteLine("                      # --max-items/--max-items-per-file below — SCALES with");
+            Console.WriteLine("                      # the --less/--more verbosity ladder (see OUTPUT OPTIONS):");
+            Console.WriteLine("                      #   --less--=5  --less=10  (default)=20  --more=50");
+            Console.WriteLine("                      #   --more++=100  --more+++=0 (unlimited)");
+            Console.WriteLine("                      # An explicit --top-files N always overrides the active");
+            Console.WriteLine("                      # preset, regardless of which one comes first on the line.");
             Console.WriteLine("  --top-files-by MODE # How to rank each file's distinctiveness for --top-files:");
             Console.WriteLine("                      #   avg-top5 (default) - avg of the file's top 5 TF-IDF");
             Console.WriteLine("                      #     terms; robust, rewards several distinctive terms");
@@ -2235,17 +2305,41 @@ class Program
             Console.WriteLine("                     # not given an explicit --top/--bottom. If the filtered");
             Console.WriteLine("                     # result set is bigger, ngc trims it and prints a notice");
             Console.WriteLine("                     # (at the END of the list, after it scrolls) telling you");
-            Console.WriteLine("                     # how to see more.");
+            Console.WriteLine("                     # how to see more. SCALES with the --less/--more verbosity");
+            Console.WriteLine("                     # ladder (see OUTPUT OPTIONS) unless set explicitly:");
+            Console.WriteLine("                     #   --less--=25  --less=50  (default)=200  --more=500");
+            Console.WriteLine("                     #   --more++=1000  --more+++=0 (unlimited)");
             Console.WriteLine("  --max-items 0      # Unlimited - never trim, no matter how big the result set");
             Console.WriteLine("  --max-items-per-file 15  # Default cap on rows shown WITHIN EACH FILE's own");
             Console.WriteLine("                           # table under --show-tfidf --per-file, independent");
             Console.WriteLine("                           # of --max-items above (which is a GLOBAL cap, not");
             Console.WriteLine("                           # a per-file one). Each capped file's header shows");
             Console.WriteLine("                           # \"(showing top N of M)\" so it's clear which file");
-            Console.WriteLine("                           # tables were trimmed vs. shown in full.");
+            Console.WriteLine("                           # tables were trimmed vs. shown in full. Also SCALES");
+            Console.WriteLine("                           # with the --less/--more ladder unless set explicitly:");
+            Console.WriteLine("                           #   --less--=5  --less=10  (default)=15  --more=30");
+            Console.WriteLine("                           #   --more++=60  --more+++=0 (unlimited)");
             Console.WriteLine("  --max-items-per-file 0   # Unlimited rows per file");
+            Console.WriteLine("  ");
+            Console.WriteLine("  NOTE: for all three of --max-items/--max-items-per-file/--top-files, an");
+            Console.WriteLine("  explicit N on the command line always overrides whatever the active");
+            Console.WriteLine("  --less/--more preset set, regardless of which one appears first.");
             
             Console.WriteLine("\nANALYSIS STRATEGIES:");
+            Console.WriteLine("  ");
+            Console.WriteLine("  # Cold Start on an Unfamiliar Corpus (never seen this text before)");
+            Console.WriteLine("  # Raw top-frequency is dominated by generic connective words even with");
+            Console.WriteLine("  # stopwords on (\"one\", \"own\", \"any\", \"here\"...) — not informative for a");
+            Console.WriteLine("  # totally cold start. This combo finds the corpus's OWN jargon instead:");
+            Console.WriteLine("  ngc 2..3 --show-pmi --pmi 3+ --freq 4+ --desc --top 40");
+            Console.WriteLine("                                    # fixed phrases/jargon glued tighter than");
+            Console.WriteLine("                                    # chance predicts — this corpus's own");
+            Console.WriteLine("                                    # terms-of-art, not generic English");
+            Console.WriteLine("  ngc 2 --files \"**/*.md\" --show-tfidf --per-file --top-files 15 --desc");
+            Console.WriteLine("                                    # which FILES are distinctive (lots of");
+            Console.WriteLine("                                    # unique content) vs. which just reuse");
+            Console.WriteLine("                                    # the same shared vocabulary as everyone");
+            Console.WriteLine("  # Run both before reading anything — they tell you what to read next.");
             Console.WriteLine("  ");
             Console.WriteLine("  # Exploratory Analysis (Start Here)");
             Console.WriteLine("  ngc 1 --top 30 --desc                    # Most frequent terms in your input");
@@ -2354,6 +2448,13 @@ class Program
                 options.ShowPpm = false;
                 options.ShowZ = false;
                 options.ShowMerged = false;
+                // ngc-feedback.md #4/#6: row-count caps scale with the ladder too —
+                // tightest at this end. Only applied if the user didn't give an
+                // explicit value (see the order-independent pre-scan above ParseArgs'
+                // main loop), so an explicit flag always wins regardless of order.
+                if (!options.MaxItemsSetExplicitly) options.MaxItems = 25;
+                if (!options.MaxItemsPerFileSetExplicitly) options.MaxItemsPerFile = 5;
+                if (!options.TopFilesSetExplicitly) options.TopFiles = 5;
                 continue;
             }
             if (a == "--less") {
@@ -2369,6 +2470,9 @@ class Program
                 options.ShowPpm = false;
                 options.ShowZ = false;
                 options.ShowMerged = false;
+                if (!options.MaxItemsSetExplicitly) options.MaxItems = 50;
+                if (!options.MaxItemsPerFileSetExplicitly) options.MaxItemsPerFile = 10;
+                if (!options.TopFilesSetExplicitly) options.TopFiles = 10;
                 continue;
             }
             if (a == "--more") {
@@ -2378,6 +2482,9 @@ class Program
                 options.ShowPpmStats = true;
                 options.ShowColumnHeader = true;
                 options.MorePresetUsed = true;
+                if (!options.MaxItemsSetExplicitly) options.MaxItems = 500;
+                if (!options.MaxItemsPerFileSetExplicitly) options.MaxItemsPerFile = 30;
+                if (!options.TopFilesSetExplicitly) options.TopFiles = 50;
                 continue;
             }
             if (a == "--more++") {
@@ -2388,6 +2495,9 @@ class Program
                 options.ShowPpmStats = true;
                 options.ShowColumnHeader = true;
                 options.MorePresetUsed = true;
+                if (!options.MaxItemsSetExplicitly) options.MaxItems = 1000;
+                if (!options.MaxItemsPerFileSetExplicitly) options.MaxItemsPerFile = 60;
+                if (!options.TopFilesSetExplicitly) options.TopFiles = 100;
                 continue;
             }
             if (a == "--more+++") {
@@ -2399,6 +2509,11 @@ class Program
                 options.ShowColumnHeader = true;
                 options.ShowZ = true;
                 options.MorePresetUsed = true;
+                // "Full detail" means unlimited across the board, matching --more+++'s
+                // existing "kitchen sink" framing.
+                if (!options.MaxItemsSetExplicitly) options.MaxItems = 0;
+                if (!options.MaxItemsPerFileSetExplicitly) options.MaxItemsPerFile = 0;
+                if (!options.TopFilesSetExplicitly) options.TopFiles = int.MaxValue;
                 continue;
             }
             if (a == "--show-input") { options.ShowInput = true; continue; }
@@ -2651,6 +2766,34 @@ class Program
                 if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
                 options.LineFilters.Add(f); continue;
             }
+            // --line-starts-with / --line-ends-with (ngc-feedback.md #1): named line-level
+            // counterparts to --starts/--ends, for the common "isolate this kind of line"
+            // case (e.g. Markdown ATX headings) without hand-writing a regex anchor onto
+            // --line-contains yourself. Same LineFilters pipeline stage as --line-contains.
+            if (a == "--line-starts-with" && i + 1 < args.Length) {
+                i++; var p = args[i];
+                var f = new TextFilter { Type = TextFilter.TypeEnum.StartsWith, Pattern = p };
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
+                options.LineFilters.Add(f); continue;
+            }
+            if (a == "--remove-line-starts-with" && i + 1 < args.Length) {
+                i++; var p = args[i];
+                var f = new TextFilter { Type = TextFilter.TypeEnum.NotStartsWith, Pattern = p };
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
+                options.LineFilters.Add(f); continue;
+            }
+            if (a == "--line-ends-with" && i + 1 < args.Length) {
+                i++; var p = args[i];
+                var f = new TextFilter { Type = TextFilter.TypeEnum.EndsWith, Pattern = p };
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
+                options.LineFilters.Add(f); continue;
+            }
+            if (a == "--remove-line-ends-with" && i + 1 < args.Length) {
+                i++; var p = args[i];
+                var f = new TextFilter { Type = TextFilter.TypeEnum.NotEndsWith, Pattern = p };
+                if (TryCompileRegex(p, out Regex rgx, options.IgnoreCase)) f.CompiledRegex = rgx;
+                options.LineFilters.Add(f); continue;
+            }
             if (a == "--starts" && i + 1 < args.Length) {
                 i++; var p = args[i];
                 var f = new TextFilter { Type = TextFilter.TypeEnum.StartsWith, Pattern = p };
@@ -2682,16 +2825,19 @@ class Program
             }
             // --max-items-per-file N (default 15; 0 = unlimited) — caps rows per-file within
             // `--show-tfidf --per-file` tables, independent of the global --max-items above
-            // (see ngc-feedback.md #3).
+            // (see ngc-feedback.md #3). Also scales with the --less/--more ladder (see
+            // presets above) unless set explicitly here, in which case this always wins.
             if (a == "--max-items-per-file" && i + 1 < args.Length) {
-                i++; if (int.TryParse(args[i], out int mipf)) { options.MaxItemsPerFile = mipf; }
+                i++; if (int.TryParse(args[i], out int mipf)) { options.MaxItemsPerFile = mipf; options.MaxItemsPerFileSetExplicitly = true; }
                 continue;
             }
             // --top-files N (0 = unlimited): caps how many --files documents get a full
             // breakdown table under `--show-tfidf --per-file`, after ranking documents by
             // an aggregate per-file distinctiveness score (see TopFilesBy / PrintTfidf).
+            // Also scales with the --less/--more ladder (see presets above) unless set
+            // explicitly here, in which case this always wins.
             if (a == "--top-files" && i + 1 < args.Length) {
-                i++; if (int.TryParse(args[i], out int tf)) { options.TopFiles = tf == 0 ? int.MaxValue : tf; }
+                i++; if (int.TryParse(args[i], out int tf)) { options.TopFiles = tf == 0 ? int.MaxValue : tf; options.TopFilesSetExplicitly = true; }
                 continue;
             }
             // --top-files-by max|sum|avg-top5 — which aggregate to rank files by (see
