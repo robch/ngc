@@ -52,8 +52,21 @@ class TfidfFilter
 class CommandOptions
 {
     public List<int> NGramSizes = new List<int>();
-    public bool ShowMerged = false;
-    public bool ShowSeparate = true;
+    // "Big" report-selector flags (see the anyBigReportFlagUsed logic in ParseArgs' post-
+    // processing step): whether to show the per-n-gram-size report (--show-ngrams/
+    // --show-n-grams) and/or the combined-across-sizes report (--show-merged-ngrams/
+    // --show-merged-n-grams). ShowNGrams defaults to true (today's baseline: n-grams show
+    // unless something says otherwise), but once ANY big --show-X flag is passed on the
+    // command line, nothing is implicit any more — ParseArgs flips ShowNGrams to false in
+    // that case unless --show-ngrams was ALSO explicitly passed (or --show-pmi was, since
+    // PMI is a column on the n-grams report, not its own report, and has nothing to attach
+    // to otherwise).
+    public bool ShowMergedNGrams = false;
+    public bool ShowNGrams = true;
+    // Tracks whether --show-ngrams/--hide-ngrams/--show-n-grams/--hide-n-grams was passed
+    // literally, so the "any big --show-X report flag suppresses n-grams unless asked for"
+    // rule below (see ParseArgs' post-processing step) doesn't clobber an explicit choice.
+    public bool ShowNGramsExplicit = false;
     public List<TextFilter> TextFilters = new List<TextFilter>();
     public List<FrequencyFilter> FrequencyFilters = new List<FrequencyFilter>();
     public List<PpmFilter> PpmFilters = new List<PpmFilter>();
@@ -92,10 +105,10 @@ class CommandOptions
     public bool ShowSummary = true;
     public bool ShowFreqStats = true;
     public bool ShowPpmStats = false;
-    public bool ShowColumnHeader = false;
+    public bool ShowColumnHeader = true;
     public bool ShowPhrases = true;
     public bool ShowTfidfPhrases = true;
-    // ShowMerged / ShowSeparate already declared above.
+    // ShowMergedNGrams / ShowNGrams already declared above.
     // Per-item columns:
     public bool ShowCount = true;
     public bool ShowPpm = false;
@@ -108,6 +121,23 @@ class CommandOptions
     // Separate namespace/report: n-grams built from the interior segments of path-like
     // units (e.g. "src/whatever" from "src/whatever/services"), distinct from prose n-grams.
     public bool ShowPathNGrams = false;
+    // Idea-007 (CDRs/ideas/idea-007-dispersion-measures.md): dispersion measures (Juilland's
+    // D and DP) per n-gram, computed from the existing PerDocNGramCounts/PerDocTotalTokensPerN
+    // dictionaries — how EVENLY a term is spread across --files documents, as distinct from how
+    // often it occurs in total. Requires --files (document boundaries).
+    public bool ShowDispersion = false;
+    // Idea-004 (CDRs/ideas/idea-004-alternate-association-measures.md): alternate collocation-
+    // strength measures alongside PMI, computed from the same unigram+n-gram count dictionaries
+    // already collected for PMI. log-Dice (Sketch Engine's default; robust to rare-pair PMI
+    // inflation), t-score (favors frequent, well-attested collocations), and MI3 (cubed mutual
+    // information; reduces low-frequency bias vs. plain PMI/MI).
+    public bool ShowLogDice = false;
+    public bool ShowTScore = false;
+    public bool ShowMi3 = false;
+    // Idea-008 (CDRs/ideas/idea-008-readability-lexical-diversity.md): whole-document/corpus
+    // summary stats — a different zoom level than everything else (one number per corpus/file,
+    // not per-phrase). TTR and MTLD only need the unigram token stream ngc already produces.
+    public bool ShowReadability = false;
     // Tracking flags (not user-facing) for the "--show-cdf/--show-pdf implies --hide-phrases
     // unless something says otherwise" rule below in ParseArgs' post-processing step.
     public bool ShowPhrasesExplicit = false; // true iff --show-phrases or --hide-phrases was passed literally
@@ -200,6 +230,10 @@ class Program
     public static Dictionary<string, Dictionary<int, int>> PerDocTotalTokensPerN { get; set; } = new Dictionary<string, Dictionary<int, int>>();
     public static Dictionary<string, Dictionary<int, Dictionary<string, int>>> PerDocPathSegmentNGramCounts { get; set; } = new Dictionary<string, Dictionary<int, Dictionary<string, int>>>();
     public static Dictionary<string, Dictionary<int, int>> PerDocPathSegmentTotalTokensPerN { get; set; } = new Dictionary<string, Dictionary<int, int>>();
+    // Idea-008: per-document ordered word-token sequence (display words, in original order),
+    // needed for TTR/MTLD — those measures are sensitive to token ORDER (MTLD walks the
+    // sequence factor-by-factor), unlike the bag-of-counts dictionaries above which lose order.
+    public static Dictionary<string, List<string>> PerDocWordSequence { get; set; } = new Dictionary<string, List<string>>();
         
     // Helper method to detect if a pattern contains regex special characters and compile it
     private static bool TryCompileRegex(string pattern, out Regex regex, bool ignoreCase = false)
@@ -291,7 +325,8 @@ class Program
         // PMI needs unigram counts (for expected-frequency chain rule), regardless of whether
         // the user asked to see 1-grams. We "force collect" size 1 (and size n-1, for n>=3,
         // in case someone wants pmi on trigrams+) without adding it to the sizes we *print*.
-        bool needPmiCollection = options.ShowPmi || options.PmiFilters.Count > 0;
+        bool needPmiCollection = options.ShowPmi || options.PmiFilters.Count > 0 ||
+            options.ShowLogDice || options.ShowTScore || options.ShowMi3;
         var collectSizes = new HashSet<int>(options.NGramSizes);
         if (needPmiCollection)
         {
@@ -321,6 +356,7 @@ class Program
         var perDocTotalTokensPerN = new Dictionary<string, Dictionary<int, int>>();
         var perDocPathSegmentNGramCounts = new Dictionary<string, Dictionary<int, Dictionary<string, int>>>();
         var perDocPathSegmentTotalTokensPerN = new Dictionary<string, Dictionary<int, int>>();
+        var perDocWordSequence = new Dictionary<string, List<string>>();
 
         // Input statistics tracking (aggregate across all documents)
         int totalChars = 0;
@@ -343,6 +379,11 @@ class Program
             var docPathSegmentTotalTokensPerN = new Dictionary<int, int>();
             foreach (int n in collectSizes) docPathSegmentTotalTokensPerN[n] = 0;
 
+            // Idea-008: ordered word sequence for this document, used by TTR/MTLD. Only
+            // populated when actually needed (--show-readability), to avoid holding onto a
+            // full token-order list for every document on every run.
+            var docWordSequence = options.ShowReadability ? new List<string>() : null;
+
             foreach (var line in docLines)
             {
                 if (string.IsNullOrWhiteSpace(line)) continue;
@@ -361,6 +402,7 @@ class Program
                 totalWords += displayWords.Count;
                 NGramBuilder.CollectNGrams(displayWords, collectSizes, nGramCounts, totalTokensPerN);
                 NGramBuilder.CollectNGrams(displayWords, collectSizes, docNGramCounts, docTotalTokensPerN);
+                docWordSequence?.AddRange(displayWords);
 
                 // Layer 3b: unigram word-frequency feed. A Unit's own Display token is NOT
                 // counted as a unigram (it's not really "a word"); instead each of its
@@ -395,6 +437,7 @@ class Program
             perDocTotalTokensPerN[docName] = docTotalTokensPerN;
             perDocPathSegmentNGramCounts[docName] = docPathSegmentNGramCounts;
             perDocPathSegmentTotalTokensPerN[docName] = docPathSegmentTotalTokensPerN;
+            if (docWordSequence != null) perDocWordSequence[docName] = docWordSequence;
         }
 
         // Make per-document data available for later features (TF-IDF etc.)
@@ -403,6 +446,7 @@ class Program
         Program.PerDocTotalTokensPerN = perDocTotalTokensPerN;
         Program.PerDocPathSegmentNGramCounts = perDocPathSegmentNGramCounts;
         Program.PerDocPathSegmentTotalTokensPerN = perDocPathSegmentTotalTokensPerN;
+        Program.PerDocWordSequence = perDocWordSequence;
 
 
         // Load exclude files into text filters
@@ -613,7 +657,7 @@ class Program
         
         // Prepare merged if requested
         var merged = new List<(string ngram, int count, double ppm, double z, double pmi)>();
-        if (options.ShowMerged || options.Mode == OutputMode.Both)
+        if (options.ShowMergedNGrams || options.Mode == OutputMode.Both)
         {
             var dict = new Dictionary<string, (int count, double ppm, double z, double pmi)>(StringComparer.OrdinalIgnoreCase);
             foreach (var n in options.NGramSizes)
@@ -628,14 +672,14 @@ class Program
         }
 
         // Output according to mode
-        if (options.MinimalOutput)
+        if (options.MinimalOutput && options.ShowNGrams)
         {
-            // only ngrams lines from merged or per-bucket depending on ShowMerged/ShowSeparate
+            // only ngrams lines from merged or per-bucket depending on ShowMergedNGrams/ShowNGrams
             // NOTE: the global --max-items cap must still apply here too (--less/--less-- were
             // previously bypassing it entirely, since ApplyMaxItemsCap was only wired into the
             // non-minimal code paths below — found while re-verifying each preset after the
             // ngc-feedback.md #2 grammar rewrite).
-            if (options.ShowMerged)
+            if (options.ShowMergedNGrams)
             {
                 var mergedList = SortAndLimit(merged, options).ToList();
                 if (mergedList.Count == 0)
@@ -667,7 +711,7 @@ class Program
             return;
         }
 
-        if (options.ShowSeparate)
+        if (options.ShowNGrams)
         {
             foreach (var n in options.NGramSizes.OrderBy(x => x))
             {
@@ -802,7 +846,7 @@ class Program
             }
         }
         
-        if (options.ShowMerged)
+        if (options.ShowMergedNGrams)
         {
             if (options.ShowSectionHeader)
             {
@@ -933,6 +977,24 @@ class Program
             if (options.ShowSectionHeader) Console.WriteLine();
             PrintPathNGrams(pathSegmentNGramCounts, options);
         }
+
+        if (options.ShowDispersion)
+        {
+            if (options.ShowSectionHeader) Console.WriteLine();
+            PrintDispersion(options);
+        }
+
+        if (options.ShowLogDice || options.ShowTScore || options.ShowMi3)
+        {
+            if (options.ShowSectionHeader) Console.WriteLine();
+            PrintAltAssociationMeasures(nGramCounts, totalTokensPerN, options);
+        }
+
+        if (options.ShowReadability)
+        {
+            if (options.ShowSectionHeader) Console.WriteLine();
+            PrintReadability(options);
+        }
     }
 
     // Prints the path-segment n-gram section: same filter/sort/print machinery as the main
@@ -970,6 +1032,435 @@ class Program
             if (notice != null) Console.WriteLine(notice);
             Console.WriteLine();
         }
+    }
+
+    // Idea-007 (CDRs/ideas/idea-007-dispersion-measures.md): Juilland's D and DP (Deviation
+    // of Proportions) per n-gram, computed from PerDocNGramCounts/PerDocTotalTokensPerN —
+    // data ngc already collects for --show-tfidf. Answers "is this term used everywhere, or
+    // is it just one file screaming really loudly?" as distinct from raw frequency.
+    //
+    // Juilland's D = 1 - (CV / sqrt(n-1)), where CV is the coefficient of variation of the
+    // term's per-document RELATIVE frequencies (count-in-doc / doc's total tokens), and n is
+    // the number of documents. D ranges 0..1; D=1 means perfectly even dispersion across every
+    // document, D近0 means concentrated in very few. DP (Deviation of Proportions, Gries 2008)
+    // is a complementary 0..1 measure where LOWER = more even; DP = 0.5 * sum(|obs_i - exp_i|)
+    // where obs_i is the term's share of its occurrences in doc i, and exp_i is doc i's share
+    // of the corpus's total tokens (i.e. "expected" share if the term were spread proportional
+    // to document size).
+    static void PrintDispersion(CommandOptions options)
+    {
+        if (options.FileGlobs.Count == 0)
+        {
+            Console.WriteLine("## Dispersion (Juilland's D / DP)");
+            Console.WriteLine();
+            Console.WriteLine("(--show-dispersion requires --files; stdin has no document boundaries)");
+            Console.WriteLine();
+            return;
+        }
+
+        int docCount = Program.DocumentNames.Count;
+        if (docCount < 2)
+        {
+            Console.WriteLine("## Dispersion (Juilland's D / DP)");
+            Console.WriteLine();
+            Console.WriteLine("(dispersion is meaningless with fewer than 2 documents)");
+            Console.WriteLine();
+            return;
+        }
+
+        // Corpus-wide token totals per document, used for DP's "expected share" term.
+        var docTotalTokens = new Dictionary<string, long>();
+        long grandTotalTokens = 0;
+        foreach (var docName in Program.DocumentNames)
+        {
+            long docTotal = 0;
+            if (Program.PerDocTotalTokensPerN.TryGetValue(docName, out var perN))
+                foreach (var kv in perN) docTotal += kv.Value; // summed across n just for a size proxy
+            docTotalTokens[docName] = docTotal;
+            grandTotalTokens += docTotal;
+        }
+
+        foreach (var n in options.NGramSizes.OrderBy(x => x))
+        {
+            if (options.ShowSectionHeader)
+            {
+                Console.WriteLine($"## Dispersion: {n}-grams (Juilland's D / DP across {docCount} documents)");
+                Console.WriteLine();
+            }
+
+            // ngram -> per-document raw count (only docs where it occurs need an entry;
+            // absence means 0 for that doc).
+            var perNgramDocCounts = new Dictionary<string, Dictionary<string, int>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var docName in Program.DocumentNames)
+            {
+                if (!Program.PerDocNGramCounts.TryGetValue(docName, out var docCounts)) continue;
+                if (!docCounts.TryGetValue(n, out var ngramCounts)) continue;
+                foreach (var kv in ngramCounts)
+                {
+                    if (kv.Value <= 0) continue;
+                    if (!perNgramDocCounts.TryGetValue(kv.Key, out var byDoc))
+                    {
+                        byDoc = new Dictionary<string, int>();
+                        perNgramDocCounts[kv.Key] = byDoc;
+                    }
+                    byDoc[docName] = kv.Value;
+                }
+            }
+
+            var rows = new List<(string ngram, int totalCount, double juillandD, double dp)>();
+            foreach (var kv in perNgramDocCounts)
+            {
+                var ngram = kv.Key;
+                if (!PassTextFilters(ngram, options.TextFilters, options.IgnoreCase)) continue;
+                if (!PassStopwordFilter(ngram, options)) continue;
+                if (!PassTrimFilter(ngram, options)) continue;
+
+                var byDoc = kv.Value;
+                int totalCount = byDoc.Values.Sum();
+                if (!PassFrequencyFilters(totalCount, options.FrequencyFilters)) continue;
+
+                // Juilland's D: coefficient of variation over per-doc RELATIVE frequencies
+                // (count-in-doc / doc's total tokens), across ALL documents (0 for docs the
+                // term never appears in — that absence is exactly what should pull D down).
+                var relFreqs = new double[docCount];
+                for (int i = 0; i < docCount; i++)
+                {
+                    var docName = Program.DocumentNames[i];
+                    int c = byDoc.TryGetValue(docName, out var cc) ? cc : 0;
+                    long docTotal = docTotalTokens[docName];
+                    relFreqs[i] = docTotal > 0 ? (double)c / docTotal : 0.0;
+                }
+                double mean = relFreqs.Average();
+                double sd = mean > 0
+                    ? Math.Sqrt(relFreqs.Sum(v => (v - mean) * (v - mean)) / docCount)
+                    : 0.0;
+                double cv = mean > 0 ? sd / mean : 0.0;
+                double juillandD = mean > 0 ? 1.0 - (cv / Math.Sqrt(docCount - 1)) : 0.0;
+                juillandD = Math.Max(0.0, Math.Min(1.0, juillandD));
+
+                // DP (Gries 2008): 0.5 * sum(|obs_i - exp_i|), where obs_i is this term's
+                // share of ITS OWN total occurrences that fell in doc i, and exp_i is doc i's
+                // share of the corpus's total tokens (the "expected" share under an even split
+                // proportional to document size).
+                double dp = 0.0;
+                if (totalCount > 0 && grandTotalTokens > 0)
+                {
+                    for (int i = 0; i < docCount; i++)
+                    {
+                        var docName = Program.DocumentNames[i];
+                        int c = byDoc.TryGetValue(docName, out var cc) ? cc : 0;
+                        double obs = (double)c / totalCount;
+                        double exp = (double)docTotalTokens[docName] / grandTotalTokens;
+                        dp += Math.Abs(obs - exp);
+                    }
+                    dp *= 0.5;
+                }
+
+                rows.Add((ngram, totalCount, juillandD, dp));
+            }
+
+            // Sort ascending by Juilland's D by default (idea-007's framing: "used everywhere
+            // a little" vs "screaming loudly in one file" — the low-D end is the interesting,
+            // concentrated-in-one-file tail most users will want to see first), honoring
+            // --asc/--desc same as everywhere else.
+            var sorted = options.Sort == SortDirection.Asc
+                ? rows.OrderBy(r => r.juillandD).ThenBy(r => r.ngram)
+                : rows.OrderByDescending(r => r.juillandD).ThenBy(r => r.ngram);
+            var limited = sorted.AsEnumerable();
+            if (options.Limit < int.MaxValue) limited = limited.Take(options.Limit);
+            var limitedList = ApplyMaxItemsCap(limited.ToList(), options, options.Sort == SortDirection.Asc ? "ascending by Juilland's D" : "descending by Juilland's D", out var notice);
+
+            if (options.ShowSummary)
+            {
+                Console.WriteLine($"Count: {rows.Count} (unique)");
+                Console.WriteLine();
+            }
+
+            int phraseWidth = limitedList.Count > 0 ? limitedList.Max(r => r.ngram.Length) : 0;
+            phraseWidth = Math.Max(phraseWidth, "PHRASE".Length);
+
+            if (options.ShowColumnHeader)
+                Console.WriteLine($"COUNT   D       DP      {"PHRASE".PadRight(phraseWidth)}");
+
+            if (options.ShowPhrases)
+            {
+                foreach (var r in limitedList)
+                    Console.WriteLine($"{r.totalCount,-7} {r.juillandD,-7:F2} {r.dp,-7:F2} {r.ngram.PadRight(phraseWidth)}");
+            }
+            if (notice != null) Console.WriteLine(notice);
+            Console.WriteLine();
+        }
+
+        Console.WriteLine("Note: D near 1.0 = spread evenly across documents; D near 0.0 = concentrated");
+        Console.WriteLine("      in very few documents (\"screaming loudly in one file\"). DP is the");
+        Console.WriteLine("      complementary reading — near 0.0 = even, near 1.0 = concentrated.");
+        Console.WriteLine();
+    }
+
+    // Idea-004 (CDRs/ideas/idea-004-alternate-association-measures.md): log-Dice, t-score,
+    // and MI3 as alternates/complements to PMI, computed from the same unigram+n-gram count
+    // dictionaries already gathered for PMI (see needPmiCollection in Main). All three are
+    // sibling formulas over the exact same inputs PMI already uses — no new collection pass.
+    static void PrintAltAssociationMeasures(
+        Dictionary<int, Dictionary<string, int>> nGramCounts,
+        Dictionary<int, int> totalTokensPerN,
+        CommandOptions options)
+    {
+        if (!nGramCounts.ContainsKey(1))
+        {
+            Console.WriteLine("## Alternate Association Measures");
+            Console.WriteLine();
+            Console.WriteLine("(log-Dice/t-score/MI3 need unigram counts internally; none were collected)");
+            Console.WriteLine();
+            return;
+        }
+
+        double totalUnigramTokens = Math.Max(1, totalTokensPerN.TryGetValue(1, out var t1) ? t1 : 0);
+        var unigramCounts = nGramCounts[1];
+
+        foreach (var n in options.NGramSizes.OrderBy(x => x))
+        {
+            if (n < 2) continue; // all three measures are meaningless for unigrams (no co-occurrence)
+            if (!nGramCounts.TryGetValue(n, out var counts) || counts.Count == 0) continue;
+
+            if (options.ShowSectionHeader)
+            {
+                var cols = new List<string>();
+                if (options.ShowLogDice) cols.Add("log-Dice");
+                if (options.ShowTScore) cols.Add("t-score");
+                if (options.ShowMi3) cols.Add("MI3");
+                Console.WriteLine($"## Alternate Association Measures: {n}-grams ({string.Join(", ", cols)})");
+                Console.WriteLine();
+            }
+
+            double totalNgramTokens = Math.Max(1, totalTokensPerN.TryGetValue(n, out var tn) ? tn : 0);
+
+            var rows = new List<(string ngram, int count, double logDice, double tScore, double mi3)>();
+            foreach (var kv in counts)
+            {
+                var ngram = kv.Key;
+                int count = kv.Value;
+                if (!PassTextFilters(ngram, options.TextFilters, options.IgnoreCase)) continue;
+                if (!PassStopwordFilter(ngram, options)) continue;
+                if (!PassTrimFilter(ngram, options)) continue;
+                if (!PassFrequencyFilters(count, options.FrequencyFilters)) continue;
+
+                var words = ngram.Split(' ');
+                bool haveAllWords = true;
+                double sumUnigramFreq = 0.0; // for log-Dice's denominator (sum of component frequencies)
+                double expectedProbProduct = 1.0; // for t-score/MI3's expected-count term
+                foreach (var w in words)
+                {
+                    if (unigramCounts.TryGetValue(w, out var uc))
+                    {
+                        sumUnigramFreq += uc;
+                        expectedProbProduct *= uc / totalUnigramTokens;
+                    }
+                    else { haveAllWords = false; break; }
+                }
+
+                double logDice = 0.0, tScore = 0.0, mi3 = 0.0;
+                if (haveAllWords)
+                {
+                    // log-Dice: 14 + log2( 2*count / sumUnigramFreq ). The "14 +" offset is
+                    // Sketch Engine's own convention purely to keep typical scores positive;
+                    // it doesn't change relative ranking, only the display scale.
+                    if (sumUnigramFreq > 0 && count > 0)
+                        logDice = 14.0 + Math.Log(2.0 * count / sumUnigramFreq, 2);
+
+                    // t-score: (observed - expected) / sqrt(observed), where expected count
+                    // is the chance-co-occurrence count implied by the words' own frequencies.
+                    double expectedCount = expectedProbProduct * totalNgramTokens;
+                    if (count > 0)
+                        tScore = (count - expectedCount) / Math.Sqrt(count);
+
+                    // MI3: log2( count^3 / (totalNgramTokens^2 * expectedProbProduct) ) — the
+                    // "cubed" variant of plain PMI/MI, which reduces PMI's well-known bias
+                    // toward inflating rare pairs while keeping the same "surprise" flavor.
+                    if (expectedProbProduct > 0 && count > 0)
+                        mi3 = Math.Log(Math.Pow(count, 3) / (totalNgramTokens * totalNgramTokens * expectedProbProduct), 2);
+                }
+
+                rows.Add((ngram, count, logDice, tScore, mi3));
+            }
+
+            // Sort by whichever measure is enabled (log-Dice > t-score > MI3 priority when
+            // more than one is on simultaneously), descending by default like PMI.
+            Func<(string ngram, int count, double logDice, double tScore, double mi3), double> sortKey =
+                options.ShowLogDice ? (r => r.logDice) :
+                options.ShowTScore ? (r => r.tScore) :
+                (r => r.mi3);
+
+            var sorted = options.Sort == SortDirection.Asc
+                ? rows.OrderBy(sortKey).ThenBy(r => r.ngram)
+                : rows.OrderByDescending(sortKey).ThenBy(r => r.ngram);
+            var limited = sorted.AsEnumerable();
+            if (options.Limit < int.MaxValue) limited = limited.Take(options.Limit);
+            var limitedList = ApplyMaxItemsCap(limited.ToList(), options, options.Sort == SortDirection.Asc ? "ascending" : "descending", out var notice);
+
+            if (options.ShowSummary)
+            {
+                Console.WriteLine($"Count: {rows.Count} (unique)");
+                Console.WriteLine();
+            }
+
+            int phraseWidth = limitedList.Count > 0 ? limitedList.Max(r => r.ngram.Length) : 0;
+            phraseWidth = Math.Max(phraseWidth, "PHRASE".Length);
+
+            if (options.ShowColumnHeader)
+            {
+                var headerCols = new StringBuilder("COUNT   ");
+                if (options.ShowLogDice) headerCols.Append("LOGDICE ");
+                if (options.ShowTScore) headerCols.Append("TSCORE  ");
+                if (options.ShowMi3) headerCols.Append("MI3     ");
+                headerCols.Append(("PHRASE").PadRight(phraseWidth));
+                Console.WriteLine(headerCols.ToString());
+            }
+
+            if (options.ShowPhrases)
+            {
+                foreach (var r in limitedList)
+                {
+                    var sb = new StringBuilder();
+                    sb.Append($"{r.count,-7} ");
+                    if (options.ShowLogDice) sb.Append($"{r.logDice,-7:F2} ");
+                    if (options.ShowTScore) sb.Append($"{r.tScore,-7:F2} ");
+                    if (options.ShowMi3) sb.Append($"{r.mi3,-7:F2} ");
+                    sb.Append(r.ngram.PadRight(phraseWidth));
+                    Console.WriteLine(sb.ToString());
+                }
+            }
+            if (notice != null) Console.WriteLine(notice);
+            Console.WriteLine();
+        }
+    }
+
+    // Idea-008 (CDRs/ideas/idea-008-readability-lexical-diversity.md): whole-document/corpus
+    // summary stats — TTR (Type-Token Ratio) and MTLD (Measure of Textual Lexical Diversity).
+    // A different zoom level than everything else: one number per document/corpus, not per-
+    // phrase. Both only need the ordered unigram token stream ngc already produces (see
+    // PerDocWordSequence, populated in Main only when --show-readability is set).
+    const double MtldTtrThreshold = 0.72; // standard MTLD factor-completion threshold (McCarthy & Jarvis 2010)
+
+    static void PrintReadability(CommandOptions options)
+    {
+        Console.WriteLine("## Readability / Lexical Diversity");
+        Console.WriteLine();
+
+        if (Program.PerDocWordSequence.Count == 0)
+        {
+            Console.WriteLine("(no word sequence data collected — this shouldn't happen if --show-readability was set)");
+            Console.WriteLine();
+            return;
+        }
+
+        // Compute one row per document, then sort/cap using the same pipeline every other
+        // report uses (--asc/--desc, --top/--bottom, --max-items) — sorted by MTLD, since
+        // that's the length-robust, more meaningful of the two measures.
+        var rows = new List<(string docName, int tokenCount, int typeCount, double ttr, double mtld)>();
+        var aggregateWords = new List<string>();
+        foreach (var docName in Program.DocumentNames)
+        {
+            if (!Program.PerDocWordSequence.TryGetValue(docName, out var words)) continue;
+            aggregateWords.AddRange(words);
+
+            int tokenCount = words.Count;
+            int typeCount = new HashSet<string>(words, StringComparer.OrdinalIgnoreCase).Count;
+            double ttr = tokenCount > 0 ? (double)typeCount / tokenCount : 0.0;
+            double mtld = ComputeMtld(words);
+            rows.Add((docName, tokenCount, typeCount, ttr, mtld));
+        }
+
+        var sorted = options.Sort == SortDirection.Asc
+            ? rows.OrderBy(r => r.mtld).ThenBy(r => r.docName)
+            : rows.OrderByDescending(r => r.mtld).ThenBy(r => r.docName);
+        var limited = sorted.AsEnumerable();
+        if (options.Limit < int.MaxValue) limited = limited.Take(options.Limit);
+        var limitedList = ApplyMaxItemsCap(limited.ToList(), options, options.Sort == SortDirection.Asc ? "ascending by MTLD" : "descending by MTLD", out var notice);
+
+        if (options.ShowSummary)
+        {
+            Console.WriteLine($"Count: {rows.Count} document(s)");
+            Console.WriteLine();
+        }
+
+        if (options.ShowColumnHeader)
+            Console.WriteLine("TOKENS  TYPES   TTR     MTLD    DOCUMENT");
+
+        if (options.ShowPhrases)
+        {
+            foreach (var r in limitedList)
+                Console.WriteLine($"{r.tokenCount,-7} {r.typeCount,-7} {r.ttr,-7:F3} {r.mtld,-7:F1} {r.docName}");
+        }
+        if (notice != null) Console.WriteLine(notice);
+
+        // Whole-corpus aggregate row, only meaningful/distinct when there's more than one doc.
+        // Always shown in full (never subject to the per-document --max-items cap above).
+        if (Program.DocumentNames.Count > 1)
+        {
+            int tokenCount = aggregateWords.Count;
+            int typeCount = new HashSet<string>(aggregateWords, StringComparer.OrdinalIgnoreCase).Count;
+            double ttr = tokenCount > 0 ? (double)typeCount / tokenCount : 0.0;
+            double mtld = ComputeMtld(aggregateWords);
+            Console.WriteLine();
+            Console.WriteLine($"{tokenCount,-7} {typeCount,-7} {ttr,-7:F3} {mtld,-7:F1} (WHOLE CORPUS)");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("Note: TTR (unique words / total words) is sensitive to document length —");
+        Console.WriteLine("      shorter documents/samples naturally score higher TTR. MTLD corrects");
+        Console.WriteLine("      for this by averaging the token-count needed for TTR to drop to");
+        Console.WriteLine($"      {MtldTtrThreshold:F2} across repeated forward/backward passes — higher MTLD =");
+        Console.WriteLine("      more lexically varied text, independent of sample length.");
+        Console.WriteLine();
+    }
+
+    // MTLD (McCarthy & Jarvis, 2010): walks the token sequence accumulating a running TTR;
+    // whenever that running TTR drops to or below MtldTtrThreshold, a "factor" is completed
+    // and the running counters reset. The final (possibly partial) factor is given partial
+    // credit proportional to how close its own TTR got to the threshold. MTLD = total tokens
+    // / total factor count (full + partial). Computed forward and backward, then averaged,
+    // per the original algorithm, to reduce sensitivity to where exactly the text starts/ends.
+    static double ComputeMtld(List<string> words)
+    {
+        if (words.Count < 2) return 0.0;
+
+        double forward = MtldOneDirection(words);
+        var reversed = new List<string>(words);
+        reversed.Reverse();
+        double backward = MtldOneDirection(reversed);
+        return (forward + backward) / 2.0;
+    }
+
+    static double MtldOneDirection(List<string> words)
+    {
+        int factorCount = 0;
+        int tokenCount = 0;
+        var typesInFactor = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var w in words)
+        {
+            typesInFactor.Add(w);
+            tokenCount++;
+            double ttr = (double)typesInFactor.Count / tokenCount;
+            if (ttr <= MtldTtrThreshold)
+            {
+                factorCount++;
+                tokenCount = 0;
+                typesInFactor.Clear();
+            }
+        }
+
+        if (tokenCount > 0)
+        {
+            double finalTtr = typesInFactor.Count > 0 ? (double)typesInFactor.Count / tokenCount : 1.0;
+            double proportionComplete = finalTtr < 1.0 ? (1.0 - finalTtr) / (1.0 - MtldTtrThreshold) : 0.0;
+            proportionComplete = Math.Min(1.0, Math.Max(0.0, proportionComplete));
+            double totalFactors = factorCount + proportionComplete;
+            return totalFactors > 0 ? (double)words.Count / totalFactors : (double)words.Count;
+        }
+
+        return factorCount > 0 ? (double)words.Count / factorCount : (double)words.Count;
     }
 
     static void PrintTfidf(CommandOptions options)
@@ -1992,8 +2483,8 @@ class Program
             {
                 // Default if no args provided but input is piped
                 options.NGramSizes = new List<int> { 1, 2, 3 };
-                options.ShowMerged = true; 
-                options.ShowSeparate = true;  
+                options.ShowMergedNGrams = true; 
+                options.ShowNGrams = true;    
                 options.Sort = SortDirection.Asc;
                 options.StatsOnly = true; // Only show statistics, not the phrases
                 return options;
@@ -2202,11 +2693,12 @@ class Program
             Console.WriteLine("    --show-summary / --hide-summary            # unique/filtered/retained %");
             Console.WriteLine("    --show-freq-stats / --hide-freq-stats      # min/max/median/avg/90%<");
             Console.WriteLine("    --show-ppm-stats / --hide-ppm-stats");
-            Console.WriteLine("    --show-column-header / --hide-column-header");
+            Console.WriteLine("    --show-headers / --hide-headers");
             Console.WriteLine("    --show-phrases / --hide-phrases            # the ngram list body");
             Console.WriteLine("    --show-tfidf-phrases / --hide-tfidf-phrases # the TF-IDF table body (separate)");
-            Console.WriteLine("    --show-merged / --hide-merged              # combined-size section");
-            Console.WriteLine("    --show-separate / --hide-separate          # per-size sections");
+            Console.WriteLine("    --show-ngrams / --hide-ngrams               # the n-grams report itself (per-size)");
+            Console.WriteLine("    --show-merged-ngrams / --hide-merged-ngrams # combined-across-sizes report");
+            Console.WriteLine("    (--show-n-grams / --show-merged-n-grams are accepted aliases for both)");
             Console.WriteLine("  Per-item columns:");
             Console.WriteLine("    --show-count / --hide-count");
             Console.WriteLine("    --show-ppm / --hide-ppm");
@@ -2217,6 +2709,20 @@ class Program
             Console.WriteLine("    --show-pmi / --hide-pmi     # adds a PMI column to phrase rows");
             Console.WriteLine("    --show-tfidf / --hide-tfidf # requires --files");
             Console.WriteLine("    --show-path-ngrams / --hide-path-ngrams # separate report, path-like units only");
+            Console.WriteLine("    --show-dispersion / --hide-dispersion   # Juilland's D / DP, requires --files");
+            Console.WriteLine("    --show-logdice / --hide-logdice         # alt collocation measure vs. PMI");
+            Console.WriteLine("    --show-tscore / --hide-tscore           # alt collocation measure vs. PMI");
+            Console.WriteLine("    --show-mi3 / --hide-mi3                 # alt collocation measure vs. PMI");
+            Console.WriteLine("    --show-readability / --hide-readability # TTR/MTLD summary, per file + corpus");
+            Console.WriteLine("  ");
+            Console.WriteLine("  IMPORTANT — report selection: --show-ngrams is ON by default. The moment you");
+            Console.WriteLine("  pass any OTHER \"big\" --show-X report flag (--show-pdf/--show-cdf/--show-tfidf/");
+            Console.WriteLine("  --show-path-ngrams/--show-dispersion/--show-logdice/--show-tscore/--show-mi3/");
+            Console.WriteLine("  --show-readability), the n-grams report is no longer shown automatically — add");
+            Console.WriteLine("  --show-ngrams explicitly if you still want it alongside the new report. The one");
+            Console.WriteLine("  exception is --show-pmi: it's a COLUMN on the n-grams report, not a report of");
+            Console.WriteLine("  its own, so using it still implies --show-ngrams (nothing else for it to attach");
+            Console.WriteLine("  to). An explicit --show-ngrams/--hide-ngrams always wins outright, either way.");
             Console.WriteLine("  ");
             Console.WriteLine("  Explicit flags always override whatever a preset (--more/--more++/--more+++/--less/--less--) set,");
             Console.WriteLine("  regardless of order, e.g.:  ngc 1 --more+++ --hide-z   (detailed, but no Z column)");
@@ -2447,7 +2953,7 @@ class Program
                 options.ShowCount = false;
                 options.ShowPpm = false;
                 options.ShowZ = false;
-                options.ShowMerged = false;
+                options.ShowMergedNGrams = false;
                 // ngc-feedback.md #4/#6: row-count caps scale with the ladder too —
                 // tightest at this end. Only applied if the user didn't give an
                 // explicit value (see the order-independent pre-scan above ParseArgs'
@@ -2469,7 +2975,7 @@ class Program
                 options.ShowCount = true;
                 options.ShowPpm = false;
                 options.ShowZ = false;
-                options.ShowMerged = false;
+                options.ShowMergedNGrams = false;
                 if (!options.MaxItemsSetExplicitly) options.MaxItems = 50;
                 if (!options.MaxItemsPerFileSetExplicitly) options.MaxItemsPerFile = 10;
                 if (!options.TopFilesSetExplicitly) options.TopFiles = 10;
@@ -2490,7 +2996,7 @@ class Program
             if (a == "--more++") {
                 // '--more' plus a merged section combining multiple n-gram sizes.
                 options.Mode = OutputMode.Both;
-                options.ShowMerged = true;
+                options.ShowMergedNGrams = true;
                 options.ShowPpm = true;
                 options.ShowPpmStats = true;
                 options.ShowColumnHeader = true;
@@ -2503,7 +3009,7 @@ class Program
             if (a == "--more+++") {
                 // '--more++' plus the Z-score column (full detail — the "kitchen sink").
                 options.Mode = OutputMode.Detailed;
-                options.ShowMerged = true;
+                options.ShowMergedNGrams = true;
                 options.ShowPpm = true;
                 options.ShowPpmStats = true;
                 options.ShowColumnHeader = true;
@@ -2526,16 +3032,16 @@ class Program
             if (a == "--hide-freq-stats") { options.ShowFreqStats = false; continue; }
             if (a == "--show-ppm-stats") { options.ShowPpmStats = true; continue; }
             if (a == "--hide-ppm-stats") { options.ShowPpmStats = false; continue; }
-            if (a == "--show-column-header") { options.ShowColumnHeader = true; continue; }
-            if (a == "--hide-column-header") { options.ShowColumnHeader = false; continue; }
+            if (a == "--show-headers") { options.ShowColumnHeader = true; continue; }
+            if (a == "--hide-headers") { options.ShowColumnHeader = false; continue; }
             if (a == "--show-phrases") { options.ShowPhrases = true; options.ShowPhrasesExplicit = true; continue; }
             if (a == "--hide-phrases") { options.ShowPhrases = false; options.ShowPhrasesExplicit = true; continue; }
             if (a == "--show-tfidf-phrases") { options.ShowTfidfPhrases = true; continue; }
             if (a == "--hide-tfidf-phrases") { options.ShowTfidfPhrases = false; continue; }
-            if (a == "--show-merged") { options.ShowMerged = true; continue; }
-            if (a == "--hide-merged") { options.ShowMerged = false; continue; }
-            if (a == "--show-separate") { options.ShowSeparate = true; continue; }
-            if (a == "--hide-separate") { options.ShowSeparate = false; continue; }
+            if (a == "--show-merged-ngrams" || a == "--show-merged-n-grams") { options.ShowMergedNGrams = true; continue; }
+            if (a == "--hide-merged-ngrams" || a == "--hide-merged-n-grams") { options.ShowMergedNGrams = false; continue; }
+            if (a == "--show-ngrams" || a == "--show-n-grams") { options.ShowNGrams = true; options.ShowNGramsExplicit = true; continue; }
+            if (a == "--hide-ngrams" || a == "--hide-n-grams") { options.ShowNGrams = false; options.ShowNGramsExplicit = true; continue; }
             if (a == "--show-count") { options.ShowCount = true; continue; }
             if (a == "--hide-count") { options.ShowCount = false; continue; }
             if (a == "--show-ppm") { options.ShowPpm = true; continue; }
@@ -2552,6 +3058,16 @@ class Program
             if (a == "--hide-tfidf") { options.ShowTfidf = false; continue; }
             if (a == "--show-path-ngrams") { options.ShowPathNGrams = true; continue; }
             if (a == "--hide-path-ngrams") { options.ShowPathNGrams = false; continue; }
+            if (a == "--show-dispersion") { options.ShowDispersion = true; continue; }
+            if (a == "--hide-dispersion") { options.ShowDispersion = false; continue; }
+            if (a == "--show-logdice") { options.ShowLogDice = true; continue; }
+            if (a == "--hide-logdice") { options.ShowLogDice = false; continue; }
+            if (a == "--show-tscore") { options.ShowTScore = true; continue; }
+            if (a == "--hide-tscore") { options.ShowTScore = false; continue; }
+            if (a == "--show-mi3") { options.ShowMi3 = true; continue; }
+            if (a == "--hide-mi3") { options.ShowMi3 = false; continue; }
+            if (a == "--show-readability") { options.ShowReadability = true; continue; }
+            if (a == "--hide-readability") { options.ShowReadability = false; continue; }
             if (a == "--per-file") { options.PerFile = true; continue; }
             if (a == "--no-stop-words")
             {
@@ -2720,16 +3236,16 @@ class Program
             // nrange
             if (Regex.IsMatch(a, @"^\d+$"))
             {
-                int n = int.Parse(a); options.NGramSizes = new List<int> { n }; options.ShowMerged = false; options.ShowSeparate = true; continue;
+                int n = int.Parse(a); options.NGramSizes = new List<int> { n }; options.ShowMergedNGrams = false; continue;
             }
             if (Regex.IsMatch(a, @"^\d+\.\.\d+$"))
             {
                 var p = a.Split(new[] { ".." }, StringSplitOptions.None);
-                int s = int.Parse(p[0]); int e = int.Parse(p[1]); options.NGramSizes = Enumerable.Range(s, e - s + 1).ToList(); options.ShowMerged = false; options.ShowSeparate = true; continue;
+                int s = int.Parse(p[0]); int e = int.Parse(p[1]); options.NGramSizes = Enumerable.Range(s, e - s + 1).ToList(); options.ShowMergedNGrams = false; continue;
             }
             if (a.Contains(",") && Regex.IsMatch(a, @"^[\d,]+$"))
             {
-                var parts = a.Split(','); options.NGramSizes = parts.Select(x => int.Parse(x)).ToList(); options.ShowMerged = false; options.ShowSeparate = true; continue;
+                var parts = a.Split(','); options.NGramSizes = parts.Select(x => int.Parse(x)).ToList(); options.ShowMergedNGrams = false; continue;
             }
             // exclude file
             if (a == "--exclude-file" && i + 1 < args.Length) { i++; options.ExcludeFiles.Add(args[i]); continue; }
@@ -2961,6 +3477,29 @@ class Program
         if ((options.ShowCdf || options.ShowPdf) && !options.ShowPhrasesExplicit && !options.MorePresetUsed)
         {
             options.ShowPhrases = false;
+        }
+
+        // The "big" --show-X report-selector flags: each of these prints its own report
+        // section. --show-pmi is deliberately NOT in this list — it's a COLUMN added onto
+        // the n-grams report, not a report of its own, so it has nothing to attach to unless
+        // n-grams are already showing (see the "implied ngrams" carve-out just below).
+        bool anyBigReportFlagUsed = options.ShowPdf || options.ShowCdf || options.ShowTfidf ||
+            options.ShowPathNGrams || options.ShowDispersion || options.ShowLogDice ||
+            options.ShowTScore || options.ShowMi3 || options.ShowReadability;
+
+        // Rule (CDRs discussion, this session): --show-X flags are report SELECTORS. If the
+        // user asked for any of the "big" reports above, nothing is implicit any more — the
+        // n-grams report only shows if --show-ngrams was ALSO explicitly requested. The one
+        // exception is --show-pmi: since it's a column on the n-grams report rather than its
+        // own report, requesting it implies the n-grams report must be visible too (there's
+        // nothing else for that column to attach to). An explicit --show-ngrams/--hide-ngrams
+        // always wins outright, regardless of order (ShowNGramsExplicit tracks that).
+        if (!options.ShowNGramsExplicit)
+        {
+            if (anyBigReportFlagUsed && !options.ShowPmi)
+                options.ShowNGrams = false;
+            else
+                options.ShowNGrams = true; // default (no big flags, or only --show-pmi): show n-grams, matches today's baseline
         }
 
         return options;
